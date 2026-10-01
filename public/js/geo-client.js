@@ -131,3 +131,14 @@ export function hitSherd(worldX, worldY, sherds, layout, cards) {
   }
   return { sherd: null, card, local: null };
 }
+
+// 陶片局部毫米点 → 该照片上的像素坐标（测点以像素坐标保存）。
+export function localMmToPixel(sh, localMm) {
+  const ppm = sherdPpm(sh);
+  return { x: localMm.x * ppm, y: localMm.y * ppm };
+}
+
+// 陶片局部毫米点 → 画布世界(mm)坐标（叠加卡片偏移）。
+export function sherdLocalToWorld(card, pose, localMm) {
+  return applyPose(pose, localMm.x, localMm.y);
+}

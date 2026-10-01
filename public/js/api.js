@@ -64,4 +64,9 @@ export const api = {
   exportProjectUrl: (id) => `/api/projects/${id}/export`,
   importProject: (formData) =>
     request('POST', '/api/projects/import', { body: formData }).then((r) => ({ data: r.data, status: r.status })),
+  // 跨片测距：创建（Base-Version 乐观锁）与删除。
+  createMeasurement: (pid, version, payload) =>
+    request('POST', `/api/projects/${pid}/measurements`, { version, body: payload }).then((r) => r.data),
+  deleteMeasurement: (measurementId, version) =>
+    request('DELETE', `/api/measurements/${measurementId}`, { version }).then((r) => r.data),
 };

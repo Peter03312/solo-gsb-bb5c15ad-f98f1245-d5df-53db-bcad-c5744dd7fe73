@@ -932,6 +932,293 @@ async function main() {
   const orphans = [...finalFiles].filter((f) => !baselineFiles.has(f));
   assert(orphans.length === 0, `坏包未留下孤儿照片（实际多：${orphans.join(',')}）`);
 
+  // ===================== 跨片测距（测点像素坐标 + 毫米读数现算） =====================
+  r = await req('POST', '/api/projects', { body: { name: '测距方案', tolerance_mm: 2 } });
+  assert(r.status === 201, '创建测距方案');
+  const mpid = r.json.project.id;
+  let mver = r.json.project.version;
+  const u = [];
+  for (let i = 0; i < 4; i++) {
+    const form = multipart({ label: `U${i}`, img_w: '100', img_h: '100' }, png);
+    const rr2 = await req('POST', `/api/projects/${mpid}/sherds`, { version: mver, raw: form.payload, body: form });
+    if (rr2.status !== 201) throw new Error('测距方案上传失败: ' + JSON.stringify(rr2.json));
+    mver = rr2.json.project.version;
+    u.push(rr2.json.sherds[rr2.json.sherds.length - 1].id);
+  }
+  // U0..U2 标比例尺（100px=10mm ⇒ 每片 10mm×10mm）；U3 不标
+  for (let i = 0; i < 3; i++) {
+    const rr2 = await req('PATCH', `/api/sherds/${u[i]}/scale`,
+      { version: mver, body: { scale_px: 100, scale_mm: 10 } });
+    assert(rr2.status === 200, '测距方案比例尺');
+    mver = rr2.json.project.version;
+  }
+  assert(Array.isArray((await req('GET', `/api/projects/${mpid}`)).json.measurements),
+    '方案读取负载携带 measurements 数组');
+
+  const measureBody = (over) => ({
+    from_sherd_id: u[0], to_sherd_id: u[1],
+    from_name: 'U0起点', to_name: 'U1终点',
+    from_point: { x: 0, y: 0 }, to_point: { x: 0, y: 0 },
+    ...over,
+  });
+
+  // 1) 创建前置校验
+  r = await req('POST', `/api/projects/${mpid}/measurements`, { version: mver, body: measureBody() });
+  assert(r.status === 400 && r.json.error.reason === 'measurement_sherds_disconnected',
+    '两片未连通：拒绝创建并指出原因（400）');
+  assert(r.json.error.errors.some((e) => e.includes('不在同一连通组')), '400 逐条给出“不在同一连通组”原因');
+  r = await req('POST', `/api/projects/${mpid}/measurements`,
+    { version: mver, body: measureBody({ to_sherd_id: u[3] }) });
+  assert(r.status === 400 && r.json.error.reason === 'measurement_scale_missing',
+    '终点陶片未标比例尺：400 并指出原因');
+  r = await req('POST', `/api/projects/${mpid}/measurements`,
+    { version: mver, body: measureBody({ from_sherd_id: u[0], to_sherd_id: u[0] }) });
+  assert(r.status === 400 && r.json.error.errors.some((e) => e.includes('两片不同')),
+    '两端同片：400 并指出原因');
+  r = await req('POST', `/api/projects/${mpid}/measurements`,
+    { version: mver, body: measureBody({ from_sherd_id: xp[0] }) });
+  assert(r.status === 400 && r.json.error.errors.some((e) => e.includes('不属于该方案')),
+    '陶片属于另一方案：400');
+  r = await req('POST', `/api/projects/${mpid}/measurements`,
+    { version: mver, body: measureBody({ to_point: { x: 150, y: 0 } }) });
+  assert(r.status === 400 && r.json.error.errors.some((e) => e.includes('超出照片范围')),
+    '测点像素坐标超出照片：400');
+  r = await req('POST', `/api/projects/${mpid}/measurements`,
+    { version: mver, body: measureBody({ from_point: { x: 0 } }) });
+  assert(r.status === 400, '测点坐标对象缺字段：400');
+  r = await req('POST', `/api/projects/${mpid}/measurements`,
+    { version: mver, body: measureBody({ from_name: '   ' }) });
+  assert(r.status === 400 && r.json.error.message.includes('from_name'), '空标注名称：400');
+
+  // 乐观锁：缺 Base-Version => 428；过期 => 409；拒绝均不写入
+  r = await req('POST', `/api/projects/${mpid}/measurements`, { body: measureBody() });
+  assert(r.status === 428, '创建测距缺 Base-Version => 428');
+
+  // 采纳接缝 U0->U1（tx=-10：U1 位姿 x=10mm），两片连通
+  r = await req('POST', `/api/projects/${mpid}/seams`,
+    { version: mver, body: { from_id: u[0], to_id: u[1], theta_deg: 0, tx: -10, ty: 0, join_note: 'U0-U1' } });
+  assert(r.status === 201, '采纳接缝 U0->U1');
+  mver = r.json.project.version;
+
+  r = await req('POST', `/api/projects/${mpid}/measurements`,
+    { version: mver - 1, body: measureBody() });
+  assert(r.status === 409, '过期 Base-Version 创建测距 => 409');
+  r = await req('GET', `/api/projects/${mpid}`);
+  assert(r.json.measurements.length === 0 && r.json.project.version === mver, '各种拒绝均不写入、不推进版本');
+
+  // 2) 合法创建：两片左上角照片原点。U0 局部(0,0)→世界(0,0)；U1 局部(0,0)→世界(10,0) ⇒ 10mm
+  r = await req('POST', `/api/projects/${mpid}/measurements`, { version: mver, body: measureBody() });
+  assert(r.status === 201, '创建跨片测距成功');
+  assert(r.json.project.version === mver + 1, '成功只推进一次方案版本');
+  mver = r.json.project.version;
+  let m1 = r.json.measurements[0];
+  assert(m1.computable === true && m1.distance_mm === 10 && m1.reason === null,
+    `读数按当前比例尺/位姿计算为 10mm（实际 ${m1.distance_mm}）`);
+  assert(m1.from_point.x === 0 && m1.to_point.x === 0 && m1.from_name === 'U0起点',
+    '测点以各自照片像素坐标与名称保存');
+  assert(m1.from_world_mm.x === 0 && m1.to_world_mm.x === 10, '返回两端世界毫米坐标');
+
+  // 再建一条重合点测距：U0 像素(100,0)=局部(10,0)→世界(10,0)；U1 原点→世界(10,0) ⇒ 0mm
+  r = await req('POST', `/api/projects/${mpid}/measurements`, {
+    version: mver,
+    body: measureBody({
+      from_name: 'U0右边沿', to_name: 'U1左边沿',
+      from_point: { x: 100, y: 0 }, to_point: { x: 0, y: 0 },
+    }),
+  });
+  assert(r.status === 201, '创建第二条跨片测距');
+  mver = r.json.project.version;
+  let m2 = r.json.measurements.find((x) => x.from_name === 'U0右边沿');
+  assert(m2.distance_mm === 0, '跨照片重合测点距离为 0mm');
+
+  // 3) 比例尺变化后读数随当前布局重算（m1 不受影响；m2 的 U0 端 100px 变为 5mm ⇒ 距离 5mm）
+  r = await req('PATCH', `/api/sherds/${u[0]}/scale`,
+    { version: mver, body: { scale_px: 200, scale_mm: 10 } });
+  assert(r.status === 200, '修改 U0 比例尺（200px=10mm）');
+  mver = r.json.project.version;
+  let state = r.json;
+  m1 = state.measurements.find((x) => x.id === m1.id);
+  m2 = state.measurements.find((x) => x.id === m2.id);
+  assert(m1.distance_mm === 10, '比例尺变化后 m1 重算仍为 10mm（U0 原点不动）');
+  assert(m2.distance_mm === 5, `比例尺变化后 m2 重算为 5mm（实际 ${m2.distance_mm}），不显示旧值`);
+
+  // 4) 撤销接缝：两片断开，测点保留但不可计算，不得返回旧毫米值
+  const seamU01 = state.seams.find((x) => x.from_id === u[0] && x.to_id === u[1]).id;
+  r = await req('DELETE', `/api/seams/${seamU01}`, { version: mver });
+  assert(r.status === 200, '撤销接缝 U0-U1');
+  mver = r.json.project.version;
+  for (const mm of r.json.measurements) {
+    assert(mm.computable === false && mm.distance_mm === null && mm.reason === 'disconnected',
+      `断开后测距 #${mm.id} 标记不可计算且不带旧读数`);
+    assert(mm.from_point && mm.to_point && mm.from_name, '断开后测点像素坐标与名称保留');
+  }
+  assert(r.json.measurements.length === 2, '断开不删除测点记录');
+
+  // 5) 重连：读数恢复（仍是按当前比例尺算出的值，而非断开前缓存）
+  r = await req('POST', `/api/projects/${mpid}/seams`,
+    { version: mver, body: { from_id: u[0], to_id: u[1], theta_deg: 0, tx: -10, ty: 0 } });
+  assert(r.status === 201, '重新采纳接缝，两片重连');
+  mver = r.json.project.version;
+  m2 = r.json.measurements.find((x) => x.id === m2.id);
+  assert(m2.computable === true && m2.distance_mm === 5, '重连后恢复读数（5mm，按当前比例尺重算）');
+
+  // 6) 接缝修订：预览与确认负载都携带按修订后位姿重算的测距读数
+  const seamU01b = r.json.seams.find((x) => x.from_id === u[0] && x.to_id === u[1]).id;
+  r = await req('POST', `/api/seams/${seamU01b}/revision-preview`,
+    { body: { theta_deg: 0, tx: -12, ty: 0, join_note: 'U0-U1 改' } });
+  assert(r.status === 200 && Array.isArray(r.json.measurements), '修订预览负载同构携带 measurements');
+  m1 = r.json.measurements.find((x) => x.from_name === 'U0起点');
+  m2 = r.json.measurements.find((x) => x.from_name === 'U0右边沿');
+  assert(m1.distance_mm === 12, `预览中 m1 随修订位姿变为 12mm（实际 ${m1.distance_mm}）`);
+  r = await req('PATCH', `/api/seams/${seamU01b}`,
+    { version: mver, body: { theta_deg: 0, tx: -12, ty: 0, join_note: 'U0-U1 改' } });
+  assert(r.status === 200, '确认修订');
+  mver = r.json.project.version;
+  m1 = r.json.measurements.find((x) => x.from_name === 'U0起点');
+  m2 = r.json.measurements.find((x) => x.from_name === 'U0右边沿');
+  assert(m1.distance_mm === 12 && m2.distance_mm === 7,
+    `修订后读数按新布局重算（m1=12, m2=7；实际 ${m1.distance_mm}, ${m2.distance_mm}）`);
+
+  // 7) 批量试算负载同样携带测距（试算只读，不改动）
+  const bp = await req('POST', `/api/projects/${mpid}/seams/batch-preview`, { body: {
+    candidates: [{ from_id: u[1], to_id: u[2], theta_deg: 0, tx: -10, ty: 0 }],
+  } });
+  assert(bp.status === 200 && Array.isArray(bp.json.measurements) && bp.json.measurements.length === 2,
+    '批量试算负载携带按试算布局重算的测距');
+
+  // 8) 删除测距记录：200，版本 +1
+  const delId = r.json.measurements[0].id;
+  r = await req('DELETE', `/api/measurements/${delId}`, { version: mver });
+  assert(r.status === 200, '删除跨片测距');
+  assert(r.json.project.version === mver + 1, '删除测距推进版本');
+  mver = r.json.project.version;
+  assert(!r.json.measurements.some((x) => x.id === delId), '测距已从负载移除');
+  r = await req('DELETE', '/api/measurements/999999', { version: mver });
+  assert(r.status === 404, '删除不存在的测距 => 404');
+
+  // 9) 删除陶片：涉及它的测点标注全部清除（外键级联），其余保留
+  //    当前剩 1 条测距（m2，涉及 U0、U1）；删除 U0 后应为 0 条。
+  r = await req('DELETE', `/api/sherds/${u[0]}`, { version: mver });
+  assert(r.status === 204, '删除陶片 U0');
+  r = await req('GET', `/api/projects/${mpid}`);
+  assert(r.json.measurements.length === 0, '删除陶片时清除涉及它的全部测点标注');
+  assert(r.json.sherds.length === 3 && !r.json.sherds.some((x) => x.id === u[0]), '陶片本体已删除');
+
+  // 10) 方案包导出携带测点；导入重映射陶片身份并复算读数
+  //     新建干净的“测点转交方案”：两片 + 1 接缝 + 1 测距。
+  r = await req('POST', '/api/projects', { body: { name: '测点转交', tolerance_mm: 2 } });
+  const mppid = r.json.project.id;
+  let mpver = r.json.project.version;
+  const v = [];
+  for (let i = 0; i < 2; i++) {
+    const form = multipart({ label: `V${i}`, img_w: '100', img_h: '100' }, png);
+    const rr2 = await req('POST', `/api/projects/${mppid}/sherds`, { version: mpver, raw: form.payload, body: form });
+    mpver = rr2.json.project.version;
+    v.push(rr2.json.sherds[rr2.json.sherds.length - 1].id);
+  }
+  for (const id of v) {
+    const rr2 = await req('PATCH', `/api/sherds/${id}/scale`,
+      { version: mpver, body: { scale_px: 100, scale_mm: 10 } });
+    mpver = rr2.json.project.version;
+  }
+  await req('POST', `/api/projects/${mppid}/seams`,
+    { version: mpver, body: { from_id: v[0], to_id: v[1], theta_deg: 0, tx: -10, ty: 0 } });
+  r = await req('GET', `/api/projects/${mppid}`);
+  mpver = r.json.project.version;
+  r = await req('POST', `/api/projects/${mppid}/measurements`, {
+    version: mpver,
+    body: {
+      from_sherd_id: v[0], to_sherd_id: v[1],
+      from_name: '口沿测点A', to_name: '口沿测点B',
+      from_point: { x: 0, y: 0 }, to_point: { x: 0, y: 0 },
+    },
+  });
+  assert(r.status === 201 && r.json.measurements[0].distance_mm === 10, '测点转交方案：创建读数 10mm 的测距');
+  mpver = r.json.project.version;
+
+  const mdl = await reqBuf('GET', `/api/projects/${mppid}/export`);
+  assert(mdl.status === 200, '导出含测点的方案包');
+  const mpkg = readManifest(mdl.buf);
+  assert(Array.isArray(mpkg.manifest.measurements) && mpkg.manifest.measurements.length === 1,
+    '方案包清单携带 1 条测距');
+  const mm0 = mpkg.manifest.measurements[0];
+  assert(mm0.from_ord === 1 && mm0.to_ord === 2 && mm0.computable === true && mm0.distance_mm === 10,
+    '包内测点以陶片序号引用并附复算读数 10mm');
+
+  const mImpR = await importZip(mdl.buf);
+  assert(mImpR.status === 201, '含测点方案包导入 201');
+  const mImp = mImpR.json;
+  assert(mImp.measurements.length === 1, '导入负载含 1 条测距');
+  const im = mImp.measurements[0];
+  assert(im.from_name === '口沿测点A' && im.from_point.x === 0, '测点名称与像素坐标原样导入');
+  assert(mImp.sherds[0].id === im.from_sherd_id && mImp.sherds[1].id === im.to_sherd_id,
+    '测点两端陶片身份已重映射到新本地 id');
+  assert(im.computable === true && im.distance_mm === 10, '导入后读数按新布局复算为 10mm（不沿用旧值）');
+
+  // 10b) 当前断开（不可计算）的测点也能导出/导入：记录保留、读数为 null、重连后恢复
+  r = await req('POST', `/api/projects/${mppid}/measurements`, {
+    version: mpver,
+    body: {
+      from_sherd_id: v[0], to_sherd_id: v[1],
+      from_name: '备用起点', to_name: '备用终点',
+      from_point: { x: 50, y: 50 }, to_point: { x: 25, y: 25 },
+    },
+  });
+  const secondId = r.json.measurements[1].id;
+  assert(r.json.measurements[1].computable === true, '第二条测点创建时可计算');
+  // 断开唯一接缝（版本取第二次创建测距后的最新版本）
+  mpver = r.json.project.version;
+  const onlySeam = r.json.seams[0].id;
+  r = await req('DELETE', `/api/seams/${onlySeam}`, { version: mpver });
+  assert(r.status === 200, '断开测点转交方案接缝');
+  const discRow = r.json.measurements.find((x) => x.id === secondId);
+  assert(discRow.computable === false && discRow.distance_mm === null && discRow.reason === 'disconnected',
+    '断开后第二条测点不可计算、无旧读数');
+  const ddl = await reqBuf('GET', `/api/projects/${mppid}/export`);
+  const dmanifest = readManifest(ddl.buf).manifest;
+  const dRow = dmanifest.measurements.find((x) => x.from_name === '备用起点');
+  assert(dRow.computable === false && dRow.distance_mm === null,
+    '导出包保留断开测点且不带毫米读数');
+  const dImpR = await importZip(ddl.buf);
+  assert(dImpR.status === 201, '含断开测点的包可导入');
+  const dImpRow = dImpR.json.measurements.find((x) => x.from_name === '备用起点');
+  assert(dImpRow.computable === false && dImpRow.distance_mm === null,
+    '导入后断开测点仍不可计算、无旧读数');
+
+  // 11) 既有不含测点的方案包（清单无 measurements 字段）仍可导入
+  {
+    const { files, manifest } = readManifest(mdl.buf);
+    delete manifest.measurements;
+    files.set('manifest.json', Buffer.from(JSON.stringify(manifest)));
+    const oldStyle = rebuildZip(files);
+    const rr2 = await importZip(oldStyle);
+    assert(rr2.status === 201 && rr2.json.measurements.length === 0,
+      '无 measurements 字段的旧方案包仍可导入（测点为空）');
+  }
+
+  // 12) 非法测点包整包拒绝，不留半成品
+  const countBeforeM = (await req('GET', '/api/projects')).json.projects.length;
+  async function expectBadMeasure(label, mutate, reason) {
+    const { files, manifest } = readManifest(mdl.buf);
+    mutate(manifest);
+    files.set('manifest.json', Buffer.from(JSON.stringify(manifest)));
+    const rr2 = await importZip(rebuildZip(files));
+    assert(rr2.status === 400, `${label}：400（实际 ${rr2.status}）`);
+    assert(rr2.json.error && rr2.json.error.reason === reason,
+      `${label}：reason=${reason}（实际 ${rr2.json.error && rr2.json.error.reason}）`);
+  }
+  await expectBadMeasure('测点引用越界', (m) => { m.measurements[0].to_ord = 99; }, 'invalid_measurement');
+  await expectBadMeasure('测点两端同片', (m) => { m.measurements[0].to_ord = 1; }, 'invalid_measurement');
+  await expectBadMeasure('测点坐标越出照片', (m) => { m.measurements[0].from_px = 500; }, 'invalid_measurement');
+  await expectBadMeasure('测点名称为空', (m) => { m.measurements[0].from_name = ''; }, 'invalid_measurement');
+  await expectBadMeasure('测点序号错乱', (m) => { m.measurements[0].ord = 5; }, 'invalid_measurement');
+  await expectBadMeasure('读数被篡改', (m) => { m.measurements[0].distance_mm = 3.5; },
+    'measurement_readout_mismatch');
+  await expectBadMeasure('连通状态谎称不可计算', (m) => { m.measurements[0].computable = false; m.measurements[0].distance_mm = null; },
+    'measurement_readout_mismatch');
+  const countAfterM = (await req('GET', '/api/projects')).json.projects.length;
+  assert(countAfterM === countBeforeM, '非法测点包整包拒绝，未新增方案（无半成品）');
+
   console.log('\n全部冒烟检查通过 ✅');
   process.exit(0);
 }

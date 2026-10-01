@@ -9,6 +9,7 @@ const crypto = require('crypto');
 const { openDb } = require('./src/db');
 const layout = require('./src/layout');
 const pkg = require('./src/package');
+const measure = require('./src/measurements');
 
 const PORT = parseInt(process.env.PORT || '8080', 10);
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
@@ -237,7 +238,8 @@ function buildBatchViolations(result, sherds, toleranceMm) {
 // 试算返回体：与 GET /api/projects/:id 同构，但 seams 为“既有接缝 + 候选虚拟接缝”
 // （候选 id 为负、带 candidate_index），layout 为整批加入后的现算结果。
 function batchPayload(project, sherds, result, toleranceMm, { previewOnly }) {
-  const fakeState = { project, sherds, seams: result.all_seams, computed: result.layout };
+  const measurements = db.prepare('SELECT * FROM measurements WHERE project_id = ? ORDER BY id').all(project.id);
+  const fakeState = { project, sherds, seams: result.all_seams, measurements, computed: result.layout };
   const payload = statePayload(fakeState);
   payload.seams = result.all_seams.map((s) => ({
     id: s.id < 0 ? null : s.id,
@@ -293,8 +295,11 @@ function loadState(projectId) {
   const seams = db
     .prepare('SELECT * FROM seams WHERE project_id = ? ORDER BY id')
     .all(projectId);
+  const measurements = db
+    .prepare('SELECT * FROM measurements WHERE project_id = ? ORDER BY id')
+    .all(projectId);
   const computed = layout.computeLayout(sherds, seams, project.tolerance_mm);
-  return { project, sherds, seams, computed };
+  return { project, sherds, seams, measurements, computed };
 }
 
 function statePayload(state) {
@@ -326,7 +331,32 @@ function statePayload(state) {
       join_note: s.join_note,
       created_at: s.created_at,
     })),
+    // 跨片测距：测点像素坐标持久化；毫米读数按当前比例尺与现算位姿现算。
+    measurements: (state.measurements || []).map((m) => measurementPayload(m, state.sherds, state.computed)),
     layout: state.computed,
+  };
+}
+
+// 一条测距记录的对外结构：保存的像素测点 + 标注名称，外加按当前布局现算的读数。
+// 两片断开/缺比例尺时 computable=false（reason），绝不返回旧毫米值。
+function measurementPayload(m, sherds, computedLayout) {
+  const sherdById = new Map(sherds.map((s) => [s.id, s]));
+  const readout = measure.computeMeasurement(m, sherdById, computedLayout);
+  return {
+    id: m.id,
+    from_sherd_id: m.from_sherd_id,
+    to_sherd_id: m.to_sherd_id,
+    from_name: m.from_name,
+    to_name: m.to_name,
+    from_point: { x: m.from_px, y: m.from_py },
+    to_point: { x: m.to_px, y: m.to_py },
+    created_at: m.created_at,
+    computable: !!readout.computable,
+    reason: readout.computable ? null : readout.reason,
+    distance_mm: readout.computable ? readout.distance_mm : null,
+    from_world_mm: readout.computable ? readout.from_world : null,
+    to_world_mm: readout.computable ? readout.to_world : null,
+    group_root_sherd_id: readout.computable ? readout.group_root_sherd_id : null,
   };
 }
 
@@ -334,7 +364,8 @@ function statePayload(state) {
 // 但接缝列表为“按原 id 与排序替换参数后”的假设集合，layout 为相应重算结果。
 // 预览时该结果不入库；确认成功后 GET /api/projects/:id 与之一致。
 function revisionPayload(project, sherds, result, seamId) {
-  const fakeState = { project, sherds, seams: result.revised_seams, computed: result.layout };
+  const measurements = db.prepare('SELECT * FROM measurements WHERE project_id = ? ORDER BY id').all(project.id);
+  const fakeState = { project, sherds, seams: result.revised_seams, measurements, computed: result.layout };
   const payload = statePayload(fakeState);
   payload.base_version = project.version;
   payload.revised_seam_id = seamId;
@@ -449,6 +480,7 @@ app.get('/api/projects/:id/export', wrap((req, res) => {
   if (!project) throw new HttpError(404, '方案不存在');
   const sherds = db.prepare('SELECT * FROM sherds WHERE project_id = ? ORDER BY id').all(pid);
   const seams = db.prepare('SELECT * FROM seams WHERE project_id = ? ORDER BY id').all(pid);
+  const measurements = db.prepare('SELECT * FROM measurements WHERE project_id = ? ORDER BY id').all(pid);
   if (sherds.length === 0) {
     throw new HttpError(400, '空方案（没有陶片照片）不能导出方案包，请先上传陶片', { reason: 'export_empty_project' });
   }
@@ -465,7 +497,7 @@ app.get('/api/projects/:id/export', wrap((req, res) => {
 
   let zip;
   try {
-    zip = pkg.buildPackageZip({ project, sherds, seams, files });
+    zip = pkg.buildPackageZip({ project, sherds, seams, measurements, files });
   } catch (e) {
     if (e instanceof pkg.PackageError) throw new HttpError(500, `导出失败：${e.message}`);
     throw e;
@@ -551,6 +583,22 @@ const handlePackageImport = wrap(async (req, res) => {
           sm.theta_deg, sm.tx, sm.ty, sm.join_note
         );
         seamIdMap.set(sm.ord, sr.lastInsertRowid);
+      }
+
+      // 跨片测点：像素坐标原样落库，陶片身份由 ord 重映射到新本地 id。
+      // 读数不入库——导入完成后由 loadState 按新 id/布局现算复算。
+      const insertMeasurement = db.prepare(
+        'INSERT INTO measurements(project_id, from_sherd_id, to_sherd_id, from_name, to_name, ' +
+        'from_px, from_py, to_px, to_py) VALUES (?,?,?,?,?,?,?,?,?)'
+      );
+      for (const mm of plan.planMeasurements || []) {
+        insertMeasurement.run(
+          pid,
+          sherdIdMap.get(mm.from_ord),
+          sherdIdMap.get(mm.to_ord),
+          mm.from_name, mm.to_name,
+          mm.from_px, mm.from_py, mm.to_px, mm.to_py
+        );
       }
       return pid;
     });
@@ -942,6 +990,96 @@ app.post('/api/projects/:id/seams/batch-commit', wrap((req, res) => {
   txn();
 
   res.json(statePayload(loadState(pid)));
+}));
+
+// ---------- 跨片测距（两片陶片照片上各取一个测点）----------
+//
+// 测点只以各自照片的像素坐标保存；毫米读数不入库，由 GET 方案时按当前比例尺
+// 与已采纳接缝推导出的位姿现算。创建时要求：
+//   两端陶片属同一方案、均已标比例尺、当前处于同一连通组，且坐标落在照片内；
+//   任一不满足都返回 400 并逐条指出原因，绝不写入。
+// 写入遵循统一 Base-Version 乐观锁（409/428），成功只推进一次版本。
+
+const MEASURE_NAME_MAX = 200;
+
+function parsePoint(v, field) {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) {
+    throw new HttpError(400, `${field} 必须是 {x, y} 像素坐标对象`);
+  }
+  const x = num(v.x, `${field}.x`, { min: 0, max: 20000 });
+  const y = num(v.y, `${field}.y`, { min: 0, max: 20000 });
+  return { x, y };
+}
+
+function measureName(body, field) {
+  const v = body[field];
+  if (v === undefined || v === null) throw new HttpError(400, `缺少测点标注名称 ${field}`);
+  const s = String(v).trim();
+  if (!s) throw new HttpError(400, `测点标注名称 ${field} 不能为空`);
+  if (s.length > MEASURE_NAME_MAX) throw new HttpError(400, `${field} 过长（最多 ${MEASURE_NAME_MAX} 字符）`);
+  return s;
+}
+
+app.post('/api/projects/:id/measurements', wrap((req, res) => {
+  const pid = num(req.params.id, 'id');
+  const project = getProjectOr404(pid);
+  checkVersion(req, project);
+  const body = req.body || {};
+
+  const fromSherdId = num(body.from_sherd_id, 'from_sherd_id', { min: 1 });
+  const toSherdId = num(body.to_sherd_id, 'to_sherd_id', { min: 1 });
+  const fromName = measureName(body, 'from_name');
+  const toName = measureName(body, 'to_name');
+  const fromPoint = parsePoint(body.from_point, 'from_point');
+  const toPoint = parsePoint(body.to_point, 'to_point');
+
+  const sherds = db.prepare('SELECT * FROM sherds WHERE project_id = ? ORDER BY id').all(pid);
+  const seams = db.prepare('SELECT * FROM seams WHERE project_id = ? ORDER BY id').all(pid);
+  const input = {
+    from_sherd_id: fromSherdId,
+    to_sherd_id: toSherdId,
+    from_px: fromPoint.x,
+    from_py: fromPoint.y,
+    to_px: toPoint.x,
+    to_py: toPoint.y,
+  };
+  const { errors } = measure.validateMeasurementInput(input, {
+    sherds, seams, toleranceMm: project.tolerance_mm,
+  });
+  if (errors.length) {
+    // 归类一个便于调用方判断的 reason：连通性 / 比例尺 / 其余参数。
+    let reason = 'measurement_invalid';
+    if (errors.some((e) => e.includes('不在同一连通组'))) reason = 'measurement_sherds_disconnected';
+    else if (errors.some((e) => e.includes('毫米比例尺'))) reason = 'measurement_scale_missing';
+    throw new HttpError(400, `跨片测距创建被拒绝：${errors.join('；')}`, { reason, errors });
+  }
+
+  const txn = db.transaction(() => {
+    db.prepare(
+      'INSERT INTO measurements(project_id, from_sherd_id, to_sherd_id, from_name, to_name, ' +
+      'from_px, from_py, to_px, to_py) VALUES (?,?,?,?,?,?,?,?,?)'
+    ).run(
+      pid, fromSherdId, toSherdId, fromName, toName,
+      fromPoint.x, fromPoint.y, toPoint.x, toPoint.y
+    );
+    bump(pid);
+  });
+  txn();
+  res.status(201).json(statePayload(loadState(pid)));
+}));
+
+app.delete('/api/measurements/:id', wrap((req, res) => {
+  const mid = num(req.params.id, 'id');
+  const row = db.prepare('SELECT * FROM measurements WHERE id = ?').get(mid);
+  if (!row) throw new HttpError(404, '跨片测距不存在');
+  const project = getProjectOr404(row.project_id);
+  checkVersion(req, project);
+  const txn = db.transaction(() => {
+    db.prepare('DELETE FROM measurements WHERE id = ?').run(mid);
+    bump(row.project_id);
+  });
+  txn();
+  res.json(statePayload(loadState(row.project_id)));
 }));
 
 // ---------- 错误处理 ----------

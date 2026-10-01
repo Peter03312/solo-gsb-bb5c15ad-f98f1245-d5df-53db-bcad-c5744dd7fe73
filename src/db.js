@@ -58,6 +58,28 @@ CREATE TABLE IF NOT EXISTS seams (
 CREATE INDEX IF NOT EXISTS idx_seams_project ON seams(project_id);
 CREATE INDEX IF NOT EXISTS idx_seams_from ON seams(from_id);
 CREATE INDEX IF NOT EXISTS idx_seams_to ON seams(to_id);
+
+-- 跨片测距：一条记录两端各是某张陶片照片上的一个测点，
+-- 测点只以“所在照片的像素坐标”保存；毫米读数从不持久化，
+-- 每次读取都按当前比例尺与已采纳接缝推导的位姿现算。
+-- 删除陶片（ON DELETE CASCADE）会自动清除涉及它的全部测点标注。
+CREATE TABLE IF NOT EXISTS measurements (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id    INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  from_sherd_id INTEGER NOT NULL REFERENCES sherds(id) ON DELETE CASCADE,
+  to_sherd_id   INTEGER NOT NULL REFERENCES sherds(id) ON DELETE CASCADE,
+  from_name     TEXT NOT NULL,
+  to_name       TEXT NOT NULL,
+  from_px       REAL NOT NULL,
+  from_py       REAL NOT NULL,
+  to_px         REAL NOT NULL,
+  to_py         REAL NOT NULL,
+  created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+  CHECK (from_sherd_id <> to_sherd_id)
+);
+CREATE INDEX IF NOT EXISTS idx_measurements_project ON measurements(project_id);
+CREATE INDEX IF NOT EXISTS idx_measurements_from ON measurements(from_sherd_id);
+CREATE INDEX IF NOT EXISTS idx_measurements_to ON measurements(to_sherd_id);
 `;
 
 module.exports = { openDb };

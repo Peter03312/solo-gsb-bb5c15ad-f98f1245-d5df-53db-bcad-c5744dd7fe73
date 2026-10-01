@@ -19,6 +19,7 @@ const path = require('path');
 const crypto = require('crypto');
 const { createZip, unzip, ZipError } = require('./zip');
 const layout = require('./layout');
+const measure = require('./measurements');
 
 const PACKAGE_TYPE = 'sherd-project-package';
 const PACKAGE_VERSION = 1;
@@ -27,7 +28,9 @@ const PHOTOS_DIR = 'photos/';
 
 const MAX_SHERDS = 100000;
 const MAX_SEAMS = 100000;
+const MAX_MEASUREMENTS = 100000;
 const MAX_NOTE_LEN = 2000;
+const MAX_MEASURE_NAME_LEN = 200;
 
 class PackageError extends Error {
   constructor(message, reason = 'invalid_package', extra) {
@@ -137,6 +140,7 @@ function layoutFingerprint(comp, toleranceMm, maps) {
 //   { project, sherds(ORDER BY id), seams(ORDER BY id), files: Map<image_file, Buffer> }
 function buildPackageZip(snapshot) {
   const { project, sherds, seams, files } = snapshot;
+  const measurements = snapshot.measurements || [];
   const comp = layout.computeLayoutDetailed(sherds, seams, project.tolerance_mm);
   const allWithin = comp.cycleDetails.every((c) => c.within_tolerance);
 
@@ -179,6 +183,30 @@ function buildPackageZip(snapshot) {
   }));
   manifestSeams.forEach((m, i) => { m.ord = i + 1; });
 
+  // 跨片测点同样用包内陶片序号（ord）引用两端，避免导入端依赖源库 id。
+  // 像素坐标原样携带；另附按快照当前布局复算的毫米读数（导入端必须复算出同一值）。
+  // 测点记录即使此刻两片断开也照常导出（computable=false），重连后读数可恢复。
+  const sherdByIdMap = new Map(sherds.map((sh) => [sh.id, sh]));
+  const manifestMeasurements = measurements.map((mm, i) => {
+    const ord = i + 1;
+    const fromOrd = sherdRowByDbId.get(mm.from_sherd_id);
+    const toOrd = sherdRowByDbId.get(mm.to_sherd_id);
+    const readout = measure.computeMeasurement(mm, sherdByIdMap, comp);
+    return {
+      ord,
+      from_ord: fromOrd,
+      to_ord: toOrd,
+      from_name: mm.from_name,
+      to_name: mm.to_name,
+      from_px: mm.from_px,
+      from_py: mm.from_py,
+      to_px: mm.to_px,
+      to_py: mm.to_py,
+      computable: !!readout.computable,
+      distance_mm: readout.computable ? round3(readout.distance_mm) : null,
+    };
+  });
+
   // 导出指纹：把源库本地 id 统一规范化为包内 ord（陶片、接缝各自映射），
   // 这样导入端用新 id 重算后可得到完全相同的指纹。
   const exportMaps = { sherdMap: sherdRowByDbId, seamMap: seamRowByDbId };
@@ -195,6 +223,8 @@ function buildPackageZip(snapshot) {
     },
     sherds: manifestSherds,
     seams: manifestSeams,
+    // 跨片测距（旧版工作台导出的包没有此字段，导入端按“可缺省”处理）。
+    measurements: manifestMeasurements,
     checks: {
       all_cycles_within_tolerance: allWithin,
       cycle_residuals: comp.residuals.map((r) => ({
@@ -443,7 +473,116 @@ function readAndValidatePackage(zipBuffer, { maxPhotoBytes } = {}) {
   const comp = layout.computeLayoutDetailed(tempSherds, tempSeams, tolerance);
   const violations = comp.cycleDetails.filter((c) => !c.within_tolerance);
 
-  return { manifest, planSherds, planSeams, comp, tolerance, violations, tempSherds, tempSeams };
+  // 7b) 跨片测距（字段可缺省——既有不含测点的方案包仍可导入）：
+  //   先做纯字段校验，再用新 id 复算布局复核读数与连通性；
+  //   任一条非法都整包拒绝（不留半成品）。
+  const planMeasurements = parseManifestMeasurements(manifest, planSherds);
+  verifyMeasurementReadouts(planMeasurements, planSherds, comp);
+
+  return {
+    manifest, planSherds, planSeams, planMeasurements, comp, tolerance,
+    violations, tempSherds, tempSeams,
+  };
+}
+
+// 清单 measurements[] 纯字段校验（与陶片/接缝序号、像素坐标、名称相关）。
+function parseManifestMeasurements(manifest, planSherds) {
+  if (manifest.measurements === undefined || manifest.measurements === null) return [];
+  if (!Array.isArray(manifest.measurements)) {
+    throw new PackageError('清单 measurements 必须是数组', 'invalid_measurement');
+  }
+  if (manifest.measurements.length > MAX_MEASUREMENTS) {
+    throw new PackageError(`跨片测距数量超过上限 ${MAX_MEASUREMENTS}`, 'invalid_measurement');
+  }
+  const seenOrds = new Set();
+  return manifest.measurements.map((mm, i) => {
+    const ord = i + 1;
+    const where = `跨片测距 #${ord}`;
+    if (!mm || typeof mm !== 'object' || Array.isArray(mm)) {
+      throw new PackageError(`${where} 不是对象`, 'invalid_measurement');
+    }
+    if (mm.ord !== undefined && mm.ord !== ord) {
+      throw new PackageError(`${where} 的序号 ord 与其排列位置不一致`, 'invalid_measurement');
+    }
+    if (seenOrds.has(ord)) throw new PackageError(`${where} 序号重复`, 'invalid_measurement');
+    seenOrds.add(ord);
+    const fromOrd = Number(mm.from_ord);
+    const toOrd = Number(mm.to_ord);
+    if (!Number.isInteger(fromOrd) || !Number.isInteger(toOrd) ||
+        fromOrd < 1 || fromOrd > planSherds.length || toOrd < 1 || toOrd > planSherds.length) {
+      throw new PackageError(`${where} 两端陶片序号越界`, 'invalid_measurement');
+    }
+    if (fromOrd === toOrd) throw new PackageError(`${where} 两端指向了同一片陶片`, 'invalid_measurement');
+    const nameCheck = (nm) => typeof nm === 'string' && nm.trim().length > 0 && nm.length <= MAX_MEASURE_NAME_LEN;
+    if (!nameCheck(mm.from_name) || !nameCheck(mm.to_name)) {
+      throw new PackageError(`${where} 测点标注名称缺失、为空或过长`, 'invalid_measurement');
+    }
+    const coord = (v, label) => {
+      const n = Number(v);
+      if (!Number.isFinite(n) || n < 0 || n > 20000) {
+        throw new PackageError(`${where} ${label} 像素坐标非法`, 'invalid_measurement');
+      }
+      return n;
+    };
+    const fromPx = coord(mm.from_px, '起点');
+    const fromPy = coord(mm.from_py, '起点');
+    const toPx = coord(mm.to_px, '终点');
+    const toPy = coord(mm.to_py, '终点');
+    const fromSh = planSherds[fromOrd - 1];
+    const toSh = planSherds[toOrd - 1];
+    if (fromPx > fromSh.img_w || fromPy > fromSh.img_h) {
+      throw new PackageError(`${where} 起点测点坐标超出该陶片照片范围`, 'invalid_measurement');
+    }
+    if (toPx > toSh.img_w || toPy > toSh.img_h) {
+      throw new PackageError(`${where} 终点测点坐标超出该陶片照片范围`, 'invalid_measurement');
+    }
+    if (!fromSh.scale_px || !toSh.scale_px) {
+      throw new PackageError(`${where} 两端陶片必须都已标记毫米比例尺`, 'invalid_measurement');
+    }
+    return {
+      ord, from_ord: fromOrd, to_ord: toOrd,
+      from_name: mm.from_name.trim(), to_name: mm.to_name.trim(),
+      from_px: fromPx, from_py: fromPy, to_px: toPx, to_py: toPy,
+      declared_computable: mm.computable,
+      declared_distance_mm: mm.distance_mm,
+    };
+  });
+}
+
+// 用包内陶片/接缝重算出的布局复核每条测距：
+//   - 包内声称可计算（有读数）的，复算必须仍可计算且距离一致（容以 0.001mm 舍入误差）；
+//   - 包内声称不可计算的（导出时两片断开），复算也必须不可计算；
+//   - 导出后包内接缝/比例尺若被改动，连通状态或读数就会对不上，整包拒绝。
+// 这样导入后的读数必然是“按当前布局重算”的值，绝不沿用不可信的旧值。
+function verifyMeasurementReadouts(planMeasurements, planSherds, comp) {
+  const sherdById = new Map(planSherds.map((sh) => [sh.ord, sh]));
+  for (const mm of planMeasurements) {
+    const tempRow = {
+      from_sherd_id: mm.from_ord,
+      to_sherd_id: mm.to_ord,
+      from_px: mm.from_px, from_py: mm.from_py,
+      to_px: mm.to_px, to_py: mm.to_py,
+    };
+    const readout = measure.computeMeasurement(tempRow, sherdById, comp);
+    const declaredComputable = mm.declared_computable === true;
+    if (declaredComputable && mm.declared_distance_mm === null) {
+      throw new PackageError(`跨片测距 #${mm.ord} 声明可计算却缺少毫米读数`, 'invalid_measurement');
+    }
+    if (readout.computable !== declaredComputable) {
+      throw new PackageError(
+        `跨片测距 #${mm.ord} 的可计算状态与清单不一致：包内接缝/比例尺数据与测点连通状态矛盾，整包拒绝`,
+        'measurement_readout_mismatch');
+    }
+    if (readout.computable) {
+      const declared = Number(mm.declared_distance_mm);
+      if (!Number.isFinite(declared) || Math.abs(declared - readout.distance_mm) > 0.001) {
+        throw new PackageError(
+          `跨片测距 #${mm.ord} 复算读数 ${readout.distance_mm} mm 与清单 ${declared} mm 不一致，整包拒绝`,
+          'measurement_readout_mismatch',
+          { expected: declared, actual: readout.distance_mm });
+      }
+    }
+  }
 }
 
 // 几何校验（闭合环）单独成步：上层可先解析再据此返回 422。

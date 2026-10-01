@@ -3,6 +3,7 @@ import { esc, toast, openModal, confirmAsync } from './ui.js';
 import { openScaleModal, openAlignModal } from './modals.js';
 import { openReviseSeamModal } from './revise.js';
 import { openBatchModal } from './batch.js';
+import { openMeasurementNamesDialog } from './measure.js';
 import {
   sherdPpm, sherdMm, computeCards, sherdWorldPose, hitSherd, applyPose, DEG,
 } from './geo-client.js';
@@ -22,6 +23,7 @@ export async function mountWorkspace(projectId) {
         <div class="footer">
           <button id="btn-new-seam">新建接缝</button>
           <button id="btn-batch">批量试拼</button>
+          <button id="btn-measure" class="secondary">📏 跨片测距</button>
         </div>
       </aside>
 
@@ -33,7 +35,7 @@ export async function mountWorkspace(projectId) {
           <button class="secondary" id="zoom-fit">适应</button>
           <span class="kv" id="zoom-label"></span>
         </div>
-        <div class="canvas-hint">拖动画布平移 · 滚轮缩放 · 点击陶片选中 · 点击接缝编号查看/撤销</div>
+        <div class="canvas-hint" id="canvas-hint"></div>
       </div>
 
       <aside class="right-panel" id="right-panel"></aside>
@@ -42,9 +44,14 @@ export async function mountWorkspace(projectId) {
   let state = await api.getProject(projectId);
   let cards = computeCards(state.layout, state.sherds);
   const imageCache = new Map();
-  const selected = { sherdId: null, seamId: null };
+  const selected = { sherdId: null, seamId: null, measurementId: null };
   let highlightSeamIds = new Set();
   let alive = true;
+
+  // 跨片测距点选模式：measureMode 为 true 时，点击陶片依次收集两个测点；
+  // pendingMeasure 记录第一个测点 { sherdId, px, py, world }，等选第二个。
+  let measureMode = false;
+  let pendingMeasure = null;
 
   // 视图变换（画布世界单位 = 毫米）
   const viewT = { zoom: 1, ox: 0, oy: 0 };
@@ -204,8 +211,99 @@ export async function mountWorkspace(projectId) {
       }
     }
 
+    drawMeasurements();
     drawScaleBar();
     document.getElementById('zoom-label').textContent = `缩放 ${(viewT.zoom * 100).toFixed(0)}%（毫米显示）`;
+  }
+
+  // 跨片测点像素坐标 → 当前画布世界(mm)坐标。
+  // 已连通组内按组内世界位姿定位；断开后各片（单独成卡或分属不同组）也能落在其卡片上，
+  // 只是不会画出距离读数（调用方按 computable 决定）。缺比例尺的片无法定位。
+  function measurementWorldPoint(shId, px, py) {
+    const sh = sherdById(shId);
+    const card = cardOfSherd(shId);
+    if (!sh || !card || !sh.scale_px) return null;
+    const pose = sherdWorldPose(state.layout, card, shId);
+    if (!pose) return null;
+    const local = { x: px / sherdPpm(sh), y: py / sherdPpm(sh) };
+    return applyPose(pose, local.x, local.y);
+  }
+
+  function drawMeasurements() {
+    // 已保存的跨片测距：可算时画连线与毫米读数；不可算时两个测点灰色描边。
+    for (const m of state.measurements || []) {
+      const p1 = measurementWorldPoint(m.from_sherd_id, m.from_point.x, m.from_point.y);
+      const p2 = measurementWorldPoint(m.to_sherd_id, m.to_point.x, m.to_point.y);
+      const active = selected.measurementId === m.id;
+      if (p1 && p2 && m.computable) {
+        const a = w2s(p1.x, p1.y);
+        const b = w2s(p2.x, p2.y);
+        ctx.save();
+        ctx.strokeStyle = active ? '#b3392f' : '#7a3eb1';
+        ctx.lineWidth = active ? 3 : 2;
+        ctx.setLineDash([2, 4]);
+        ctx.beginPath();
+        ctx.moveTo(a.x, a.y);
+        ctx.lineTo(b.x, b.y);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        drawMeasureDot(a.x, a.y, active ? '#b3392f' : '#7a3eb1');
+        drawMeasureDot(b.x, b.y, active ? '#b3392f' : '#7a3eb1');
+        const label = `${m.distance_mm} mm`;
+        ctx.font = '700 12px ui-monospace, Menlo, monospace';
+        const tw = ctx.measureText(label).width;
+        const lx = (a.x + b.x) / 2 - tw / 2 - 6, ly = (a.y + b.y) / 2 - 22;
+        ctx.fillStyle = active ? '#b3392f' : '#7a3eb1';
+        roundRect(ctx, lx, ly, tw + 12, 18, 5);
+        ctx.fill();
+        ctx.fillStyle = '#fff';
+        ctx.fillText(label, lx + 6, ly + 13);
+        ctx.restore();
+      } else {
+        for (const [shId, pt, name] of [
+          [m.from_sherd_id, m.from_point, m.from_name],
+          [m.to_sherd_id, m.to_point, m.to_name],
+        ]) {
+          const p = measurementWorldPoint(shId, pt.x, pt.y);
+          if (!p) continue;
+          const s = w2s(p.x, p.y);
+          ctx.save();
+          ctx.strokeStyle = '#9a9284';
+          ctx.fillStyle = '#fffdf8';
+          ctx.lineWidth = 1.5;
+          ctx.beginPath();
+          ctx.arc(s.x, s.y, 5, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.stroke();
+          ctx.fillStyle = '#9a9284';
+          ctx.font = '11px sans-serif';
+          ctx.fillText('不可计算', s.x + 7, s.y - 6);
+          ctx.restore();
+        }
+      }
+    }
+
+    // 点选模式中已选中的第一个测点（黄色高亮）。
+    if (measureMode && pendingMeasure) {
+      const s = w2s(pendingMeasure.world.x, pendingMeasure.world.y);
+      drawMeasureDot(s.x, s.y, '#d18c12');
+    }
+  }
+
+  function drawMeasureDot(x, y, color) {
+    ctx.save();
+    ctx.fillStyle = '#fffdf8';
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    ctx.arc(x, y, 5, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.arc(x, y, 2.2, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
   }
 
   function drawScaleBar() {
@@ -259,22 +357,89 @@ export async function mountWorkspace(projectId) {
     if (panStart && (Math.abs(e.clientX - panStart.x) > 3 || Math.abs(e.clientY - panStart.y) > 3)) return;
     const r = cv.getBoundingClientRect();
     const sx = e.clientX - r.left, sy = e.clientY - r.top;
-    // 接缝标签优先
-    const lab = seamLabelBoxes.find((b) => sx >= b.x && sx <= b.x + b.w && sy >= b.y && sy <= b.y + b.h);
-    if (lab) { selected.seamId = lab.seamId; selected.sherdId = null; highlightSeamIds = new Set([lab.seamId]); renderAll(); return; }
     const w = s2w(sx, sy);
     const hit = hitSherd(w.x, w.y, state.sherds, state.layout, cards);
+
+    // 跨片测距点选模式：依次在两片上取点，不改变常规选中态。
+    if (measureMode) {
+      if (hit && hit.sherd) {
+        handleMeasurePick(hit, w);
+      } else {
+        toast('请在陶片照片范围内点击测点', 'warn');
+      }
+      return;
+    }
+
+    // 接缝标签优先
+    const lab = seamLabelBoxes.find((b) => sx >= b.x && sx <= b.x + b.w && sy >= b.y && sy <= b.y + b.h);
+    if (lab) { selected.seamId = lab.seamId; selected.sherdId = null; selected.measurementId = null; highlightSeamIds = new Set([lab.seamId]); renderAll(); return; }
     if (hit && hit.sherd) {
       selected.sherdId = hit.sherd.id;
       selected.seamId = null;
+      selected.measurementId = null;
       const card = hit.card;
       const chain = card.kind === 'group' ? (card.group.chains[hit.sherd.id] || []) : [];
       highlightSeamIds = new Set(chain);
     } else {
-      selected.sherdId = null; selected.seamId = null; highlightSeamIds = new Set();
+      selected.sherdId = null; selected.seamId = null; selected.measurementId = null; highlightSeamIds = new Set();
     }
     renderAll();
   });
+
+  // 在某片照片上点到一个测点（local 为该片局部毫米坐标），换算为照片像素后暂存。
+  function handleMeasurePick(hit, world) {
+    const sh = hit.sherd;
+    if (!sh.scale_px) {
+      toast(`陶片 #${sh.id} 尚未标记毫米比例尺，不能作为测距测点`, 'warn');
+      return;
+    }
+    const ppm = sherdPpm(sh);
+    const px = hit.local.x * ppm;
+    const py = hit.local.y * ppm;
+    const pick = { sherdId: sh.id, px, py, world: { x: world.x, y: world.y } };
+    if (!pendingMeasure) {
+      pendingMeasure = pick;
+      draw();
+      toast(`已选起点（#${sh.id}），再到另一片陶片上点击终点；点“退出测距”放弃`, 'success');
+      return;
+    }
+    if (pendingMeasure.sherdId === sh.id) {
+      // 允许改主意：在同一片上再次点击即把它当作新的起点。
+      pendingMeasure = pick;
+      draw();
+      toast('两个测点需位于两片不同陶片；已将本次点击记为新的起点，请换一片点终点', 'warn');
+      return;
+    }
+    const first = pendingMeasure;
+    pendingMeasure = null;
+    submitMeasurement(first, pick).finally(() => draw());
+  }
+
+  async function submitMeasurement(fromPick, toPick) {
+    const names = await openMeasurementNamesDialog({
+      fromPick, toPick, sherdById: (id) => sherdById(id),
+    });
+    if (!names) return; // 用户取消：不写入
+    const payload = {
+      from_sherd_id: fromPick.sherdId,
+      to_sherd_id: toPick.sherdId,
+      from_name: names.from_name,
+      to_name: names.to_name,
+      from_point: { x: Math.round(fromPick.px * 100) / 100, y: Math.round(fromPick.py * 100) / 100 },
+      to_point: { x: Math.round(toPick.px * 100) / 100, y: Math.round(toPick.py * 100) / 100 },
+    };
+    try {
+      const next = await api.createMeasurement(state.project.id, state.project.version, payload);
+      applyServerState(next);
+      const m = next.measurements[next.measurements.length - 1];
+      selected.measurementId = m.id;
+      renderAll();
+      if (m.computable) toast(`跨片测距已记录：${m.distance_mm} mm。测距模式仍开启，可继续选两片`, 'success');
+      else toast('跨片测点已保存，但当前两片不可计算（未连通）', 'warn');
+    } catch (e) {
+      handleWriteError(e);
+    }
+  }
 
   cv.addEventListener('wheel', (e) => {
     e.preventDefault();
@@ -344,6 +509,7 @@ export async function mountWorkspace(projectId) {
       </div>
 
       <div class="pane" id="pane-sherd"></div>
+      <div class="pane" id="pane-measurements"></div>
       <div class="pane flex" id="pane-seams"></div>`;
 
     document.getElementById('p-save').onclick = saveProjectSettings;
@@ -355,7 +521,26 @@ export async function mountWorkspace(projectId) {
     }
 
     renderSherdPane();
+    renderMeasurementsPane();
     renderSeamsPane(residualsById);
+  }
+
+  // 该片涉及的测点标注（删除陶片时服务器会一并清除这些测距）。
+  function relatedMeasurementsHtml(shId) {
+    const related = (state.measurements || []).filter(
+      (m) => m.from_sherd_id === shId || m.to_sherd_id === shId
+    );
+    if (!related.length) return '';
+    const items = related.map((m) => {
+      const isFrom = m.from_sherd_id === shId;
+      const name = isFrom ? m.from_name : m.to_name;
+      const otherId = isFrom ? m.to_sherd_id : m.from_sherd_id;
+      const val = m.computable
+        ? `<b>${m.distance_mm} mm</b>`
+        : '<span class="residual bad">不可计算</span>';
+      return `<div class="kv">📏 #${m.id} ${esc(name)} ↔ 陶片 #${otherId}：${val}</div>`;
+    }).join('');
+    return `<div style="margin-top:8px"><div class="kv" style="font-weight:600;color:var(--ink)">涉及测点标注（${related.length}）</div>${items}</div>`;
   }
 
   function renderSherdPane() {
@@ -390,6 +575,7 @@ export async function mountWorkspace(projectId) {
         ${pose ? `<br/>世界位姿：x=${pose.x} mm, y=${pose.y} mm, θ=${pose.theta}°` : ''}
       </div>
       ${chainHtml}
+      ${relatedMeasurementsHtml(sh.id)}
       <div style="display:flex;gap:8px;margin-top:10px">
         <button id="btn-scale">${sh.scale_px ? '修改比例尺' : '标记比例尺'}</button>
         <button class="danger" id="btn-del-sherd">删除陶片</button>
@@ -409,6 +595,64 @@ export async function mountWorkspace(projectId) {
     };
     const cc = document.getElementById('chain-card');
     if (cc) cc.onclick = () => { highlightSeamIds = new Set(chain); draw(); renderSeamsPane(new Map(state.layout.residuals.map((r) => [r.seam_id, r]))); };
+  }
+
+  function renderMeasurementsPane() {
+    const pane = document.getElementById('pane-measurements');
+    const list = state.measurements || [];
+    if (!list.length) {
+      pane.innerHTML = '<h3>跨片测距</h3><div class="kv">尚无测距。点左侧 <b>📏 跨片测距</b>，依次在两片陶片照片上点击测点。</div>';
+      return;
+    }
+    const rows = list.map((m) => {
+      const a = sherdById(m.from_sherd_id);
+      const b = sherdById(m.to_sherd_id);
+      const active = selected.measurementId === m.id ? ' active' : '';
+      const body = m.computable
+        ? `<div class="measure-val">${m.distance_mm} <span class="kv">mm</span></div>
+           <div class="kv">${esc(m.from_name)} → ${esc(m.to_name)}</div>`
+        : `<div class="measure-val bad">不可计算</div>
+           <div class="kv">${esc(m.from_name)} → ${esc(m.to_name)}<br/>原因：${
+             m.reason === 'disconnected' ? '两片当前未连通（测点保留，重连后自动恢复读数）' : '存在未标比例尺的陶片'}</div>`;
+      return `<div class="measure-row${active}" data-id="${m.id}">
+        <div class="top">
+          <span class="kv"><b>#${m.id}</b>
+            #${m.from_sherd_id} ${esc(a ? a.label : '?')} → #${m.to_sherd_id} ${esc(b ? b.label : '?')}
+          </span>
+          <button class="danger" data-del="${m.id}">删除</button>
+        </div>
+        ${body}
+      </div>`;
+    }).join('');
+    pane.innerHTML = `<h3>跨片测距（${list.length}）</h3>
+      <div class="kv" style="margin-bottom:6px">读数按当前比例尺与已采纳接缝现算；两片断开时测点保留、读数不可计算，重连后恢复。</div>
+      ${rows}`;
+
+    pane.querySelectorAll('.measure-row').forEach((el) => {
+      el.addEventListener('click', (e) => {
+        if (e.target.dataset.del) return;
+        selected.measurementId = parseInt(el.dataset.id, 10);
+        selected.sherdId = null;
+        selected.seamId = null;
+        renderAll();
+      });
+    });
+    pane.querySelectorAll('[data-del]').forEach((btn) => {
+      btn.onclick = async (e) => {
+        e.stopPropagation();
+        const id = parseInt(btn.dataset.del, 10);
+        const m = (state.measurements || []).find((x) => x.id === id);
+        if (!m) return;
+        if (await confirmAsync(`删除跨片测距 #${id}（${m.from_name} → ${m.to_name}）？`)) {
+          try {
+            const next = await api.deleteMeasurement(id, state.project.version);
+            if (selected.measurementId === id) selected.measurementId = null;
+            applyServerState(next);
+            toast('跨片测距已删除', 'success');
+          } catch (err) { handleWriteError(err); }
+        }
+      };
+    });
   }
 
   function renderSeamsPane(residualsById) {
@@ -562,6 +806,32 @@ export async function mountWorkspace(projectId) {
     });
   };
 
+  // ---------- 跨片测距点选模式 ----------
+  document.getElementById('btn-measure').onclick = () => {
+    const scaled = state.sherds.filter((s) => s.scale_px);
+    if (scaled.length < 1) return toast('请先上传陶片并标记毫米比例尺', 'warn');
+    measureMode = !measureMode;
+    pendingMeasure = null;
+    document.getElementById('btn-measure').classList.toggle('measure-active', measureMode);
+    document.getElementById('btn-measure').textContent = measureMode ? '✕ 退出测距' : '📏 跨片测距';
+    cv.style.cursor = measureMode ? 'crosshair' : '';
+    updateCanvasHint();
+    draw();
+    if (measureMode) {
+      toast('测距模式：在第一片陶片上点起点，再在另一片上点终点', 'success');
+    }
+  };
+
+  function updateCanvasHint() {
+    const el = document.getElementById('canvas-hint');
+    if (!el) return;
+    if (measureMode) {
+      el.innerHTML = '<b style="color:#b3392f">📏 测距模式</b>：在一片陶片上点起点，再到另一片点终点 · 点侧栏“退出测距”取消';
+    } else {
+      el.textContent = '拖动画布平移 · 滚轮缩放 · 点击陶片选中 · 点击接缝编号查看/撤销';
+    }
+  }
+
   function chooseSeamEnds() {
     const scaled = state.sherds.filter((s) => s.scale_px);
     if (scaled.length < 2) return toast('至少要有两片已标记比例尺的陶片', 'warn');
@@ -666,6 +936,8 @@ export async function mountWorkspace(projectId) {
     staleSeenVersion = null;
     if (selected.sherdId && !sherdById(selected.sherdId)) selected.sherdId = null;
     if (selected.seamId && !seamById(selected.seamId)) selected.seamId = null;
+    const stillHasMeasure = (state.measurements || []).some((m) => m.id === selected.measurementId);
+    if (selected.measurementId && !stillHasMeasure) selected.measurementId = null;
     renderAll();
   }
 
@@ -703,6 +975,7 @@ export async function mountWorkspace(projectId) {
     renderTopbar();
     renderSidebar();
     renderRightPanel();
+    updateCanvasHint();
     draw();
   }
 
