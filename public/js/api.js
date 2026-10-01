@@ -64,4 +64,9 @@ export const api = {
   exportProjectUrl: (id) => `/api/projects/${id}/export`,
   importProject: (formData) =>
     request('POST', '/api/projects/import', { body: formData }).then((r) => ({ data: r.data, status: r.status })),
+  // 跨片测距标注：写操作带 Base-Version；读数由服务器按当前布局现算后随方案负载返回。
+  addAnnotation: (pid, version, payload) =>
+    request('POST', `/api/projects/${pid}/annotations`, { version, body: payload }).then((r) => r.data),
+  deleteAnnotation: (annotationId, version) =>
+    request('DELETE', `/api/annotations/${annotationId}`, { version }).then((r) => r.data),
 };

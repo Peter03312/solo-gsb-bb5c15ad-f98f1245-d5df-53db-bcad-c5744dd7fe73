@@ -932,6 +932,269 @@ async function main() {
   const orphans = [...finalFiles].filter((f) => !baselineFiles.has(f));
   assert(orphans.length === 0, `坏包未留下孤儿照片（实际多：${orphans.join(',')}）`);
 
+  // ===================== 跨片测距标注 =====================
+  // 3 片 10mm×10mm 陶片连成一列（M0=0, M1=10, M2=20 mm），测点以像素坐标保存，
+  // 读数按当前比例尺与布局现算。
+  r = await req('POST', '/api/projects', { body: { name: '测距方案', tolerance_mm: 2 } });
+  assert(r.status === 201, '创建测距方案');
+  const mpid = r.json.project.id;
+  let mver = r.json.project.version;
+  const m = [];
+  for (let i = 0; i < 3; i++) {
+    const form = multipart({ label: `M${i}`, img_w: '100', img_h: '100' }, png);
+    const rr2 = await req('POST', `/api/projects/${mpid}/sherds`, { version: mver, raw: form.payload, body: form });
+    if (rr2.status !== 201) throw new Error('测距方案上传失败: ' + JSON.stringify(rr2.json));
+    mver = rr2.json.project.version;
+    m.push(rr2.json.sherds[rr2.json.sherds.length - 1].id);
+  }
+  for (const id of m) {
+    r = await req('PATCH', `/api/sherds/${id}/scale`, { version: mver, body: { scale_px: 100, scale_mm: 10 } });
+    assert(r.status === 200, '测距方案比例尺');
+    mver = r.json.project.version;
+  }
+  async function addSeamM(fromId, toId, tx) {
+    const rr2 = await req('POST', `/api/projects/${mpid}/seams`,
+      { version: mver, body: { from_id: fromId, to_id: toId, theta_deg: 0, tx, ty: 0 } });
+    if (rr2.status !== 201) throw new Error('测距方案建接缝失败: ' + JSON.stringify(rr2.json));
+    mver = rr2.json.project.version;
+    return rr2.json;
+  }
+  await addSeamM(m[0], m[1], -10); // M1 在 x=10
+  const seamM12Json = await addSeamM(m[1], m[2], -10); // M2 在 x=20
+  const seamM01 = seamM12Json.seams.find((x) => x.from_id === m[0] && x.to_id === m[1]);
+  const seamM12 = seamM12Json.seams.find((x) => x.from_id === m[1] && x.to_id === m[2]);
+  assert(Array.isArray(seamM12Json.annotations) && seamM12Json.annotations.length === 0,
+    '方案负载携带 annotations 数组（初始为空）');
+
+  // 1) 创建：M0@(50,50)px ↔ M1@(50,50)px => 世界 (5,5) 与 (15,5) => 10 mm
+  r = await req('POST', `/api/projects/${mpid}/annotations`, {
+    version: mver,
+    body: { from_id: m[0], to_id: m[1], from_x: 50, from_y: 50, to_x: 50, to_y: 50, label: '口沿宽度' },
+  });
+  assert(r.status === 201, '创建跨片测距标注 ann1');
+  assert(r.json.project.version === mver + 1, '创建标注成功仅推进一次方案版本');
+  mver = r.json.project.version;
+  const ann1 = r.json.annotations.find((x) => x.label === '口沿宽度');
+  assert(ann1 && ann1.computable === true && ann1.distance_mm === 10,
+    `ann1 读数按当前布局现算为 10 mm（实际 ${ann1 && ann1.distance_mm}）`);
+  assert(ann1.from_x === 50 && ann1.to_y === 50, '测点以各自照片像素坐标保存');
+
+  // 2) 第二条：M0@(0,0) ↔ M2@(100,100)（边界坐标允许）=> (0,0) 与 (30,10) => 31.623 mm
+  r = await req('POST', `/api/projects/${mpid}/annotations`, {
+    version: mver,
+    body: { from_id: m[0], to_id: m[2], from_x: 0, from_y: 0, to_x: 100, to_y: 100, label: '对角距' },
+  });
+  assert(r.status === 201, '创建跨片测距标注 ann2（边界像素坐标）');
+  mver = r.json.project.version;
+  const ann2 = r.json.annotations.find((x) => x.label === '对角距');
+  assert(ann2 && ann2.computable && ann2.distance_mm === 31.623,
+    `ann2 读数 31.623 mm（实际 ${ann2 && ann2.distance_mm}）`);
+
+  // 3) 前置校验：任一不满足即 400 指出原因且不写入、不推进版本
+  async function expectAnn400(label, body, reason) {
+    const rr2 = await req('POST', `/api/projects/${mpid}/annotations`, { version: mver, body });
+    assert(rr2.status === 400, `${label} => 400（实际 ${rr2.status}）`);
+    assert(rr2.json.error && rr2.json.error.reason === reason,
+      `${label}：reason=${reason}（实际 ${rr2.json.error && rr2.json.error.reason}）`);
+  }
+  await expectAnn400('同一片陶片',
+    { from_id: m[0], to_id: m[0], from_x: 1, from_y: 1, to_x: 2, to_y: 2, label: 'x' }, 'annotation_same_sherd');
+  await expectAnn400('陶片不属于方案',
+    { from_id: m[0], to_id: 999999, from_x: 1, from_y: 1, to_x: 2, to_y: 2, label: 'x' }, 'annotation_sherd_mismatch');
+  await expectAnn400('from_x 超出照片',
+    { from_id: m[0], to_id: m[1], from_x: 101, from_y: 1, to_x: 2, to_y: 2, label: 'x' }, 'annotation_point_out_of_bounds');
+  await expectAnn400('from_y 为负',
+    { from_id: m[0], to_id: m[1], from_x: 1, from_y: -0.5, to_x: 2, to_y: 2, label: 'x' }, 'annotation_point_out_of_bounds');
+  await expectAnn400('标注名称为空',
+    { from_id: m[0], to_id: m[1], from_x: 1, from_y: 1, to_x: 2, to_y: 2, label: '   ' }, 'annotation_label_missing');
+  // 未标比例尺的 M3
+  const formM3 = multipart({ label: 'M3', img_w: '100', img_h: '100' }, png);
+  r = await req('POST', `/api/projects/${mpid}/sherds`, { version: mver, raw: formM3.payload, body: formM3 });
+  mver = r.json.project.version;
+  const m3 = r.json.sherds[r.json.sherds.length - 1].id;
+  await expectAnn400('对端未标比例尺',
+    { from_id: m[0], to_id: m3, from_x: 1, from_y: 1, to_x: 2, to_y: 2, label: 'x' }, 'annotation_scale_missing');
+  // 已标比例尺但未连通的 M4
+  const formM4 = multipart({ label: 'M4', img_w: '100', img_h: '100' }, png);
+  r = await req('POST', `/api/projects/${mpid}/sherds`, { version: mver, raw: formM4.payload, body: formM4 });
+  mver = r.json.project.version;
+  const m4 = r.json.sherds[r.json.sherds.length - 1].id;
+  r = await req('PATCH', `/api/sherds/${m4}/scale`, { version: mver, body: { scale_px: 100, scale_mm: 10 } });
+  mver = r.json.project.version;
+  await expectAnn400('两片不在同一连通组',
+    { from_id: m[0], to_id: m4, from_x: 1, from_y: 1, to_x: 2, to_y: 2, label: 'x' }, 'annotation_not_connected');
+  r = await req('GET', `/api/projects/${mpid}`);
+  assert(r.json.project.version === mver && r.json.annotations.length === 2,
+    '全部 400 均未写入、未推进版本（标注仍为 2 条）');
+
+  // 4) 乐观锁：缺 Base-Version => 428；过期 => 409
+  r = await req('POST', `/api/projects/${mpid}/annotations`,
+    { body: { from_id: m[0], to_id: m[1], from_x: 1, from_y: 1, to_x: 2, to_y: 2, label: 'x' } });
+  assert(r.status === 428, '创建标注缺 Base-Version => 428');
+  r = await req('POST', `/api/projects/${mpid}/annotations`, {
+    version: mver - 1,
+    body: { from_id: m[0], to_id: m[1], from_x: 1, from_y: 1, to_x: 2, to_y: 2, label: 'x' },
+  });
+  assert(r.status === 409 && r.json.error.current_version === mver, '过期 Base-Version => 409');
+
+  // 5) 接缝修订后读数随布局重算：M0->M1 改为 tx=-11 => ann1 变 11 mm、ann2 变 32.573 mm
+  r = await req('PATCH', `/api/seams/${seamM01.id}`,
+    { version: mver, body: { theta_deg: 0, tx: -11, ty: 0 } });
+  assert(r.status === 200, '修订接缝 M0->M1 为 tx=-11');
+  mver = r.json.project.version;
+  const ann1AfterRevise = r.json.annotations.find((x) => x.label === '口沿宽度');
+  const ann2AfterRevise = r.json.annotations.find((x) => x.label === '对角距');
+  assert(ann1AfterRevise.distance_mm === 11, `修订后 ann1 重算为 11 mm（实际 ${ann1AfterRevise.distance_mm}）`);
+  assert(ann2AfterRevise.distance_mm === 32.573, `修订后 ann2 重算为 32.573 mm（实际 ${ann2AfterRevise.distance_mm}）`);
+
+  // 6) 比例尺变化后读数重算：M0 改为 200px=10mm => ann1 变为 hypot(13.5, 2.5) ≈ 13.73
+  r = await req('PATCH', `/api/sherds/${m[0]}/scale`, { version: mver, body: { scale_px: 200, scale_mm: 10 } });
+  assert(r.status === 200, '修改 M0 比例尺');
+  mver = r.json.project.version;
+  const ann1Scaled = r.json.annotations.find((x) => x.label === '口沿宽度');
+  assert(Math.abs(ann1Scaled.distance_mm - 13.73) < 0.001,
+    `比例尺变化后 ann1 重算为 ≈13.73 mm（实际 ${ann1Scaled.distance_mm}）`);
+  r = await req('PATCH', `/api/sherds/${m[0]}/scale`, { version: mver, body: { scale_px: 100, scale_mm: 10 } });
+  mver = r.json.project.version;
+  assert(r.json.annotations.find((x) => x.label === '口沿宽度').distance_mm === 11, '恢复比例尺后 ann1 回到 11 mm');
+
+  // 7) 断开：撤销 M1->M2 => ann2 保留测点但标为不可计算（distance_mm 为 null，绝不显示旧值）
+  r = await req('DELETE', `/api/seams/${seamM12.id}`, { version: mver });
+  assert(r.status === 200, '撤销接缝 M1->M2');
+  mver = r.json.project.version;
+  const ann2Broken = r.json.annotations.find((x) => x.label === '对角距');
+  assert(ann2Broken && ann2Broken.computable === false && ann2Broken.distance_mm === null,
+    '两片断开后标注保留但标为不可计算（无旧读数）');
+  assert(ann2Broken.to_x === 100 && ann2Broken.to_y === 100, '断开时测点像素坐标仍保留');
+  assert(r.json.annotations.find((x) => x.label === '口沿宽度').distance_mm === 11, 'ann1 不受影响仍为 11 mm');
+
+  // 8) 重连：重新采纳 M1->M2 => ann2 恢复读数（按新布局现算）
+  await addSeamM(m[1], m[2], -10);
+  r = await req('GET', `/api/projects/${mpid}`);
+  const ann2Rejoined = r.json.annotations.find((x) => x.label === '对角距');
+  assert(ann2Rejoined.computable === true && ann2Rejoined.distance_mm === 32.573,
+    `重连后 ann2 恢复读数 32.573 mm（实际 ${ann2Rejoined.distance_mm}）`);
+
+  // 9) 批量试算/确认负载同样携带按假设布局现算的标注读数
+  r = await req('POST', `/api/projects/${mpid}/seams/batch-preview`, { body: { candidates: [
+    { from_id: m[0], to_id: m[2], theta_deg: 0, tx: -20, ty: 0, join_note: '复核 M0-M2' },
+  ] } });
+  assert(r.status === 200 && Array.isArray(r.json.annotations), '批量试算负载携带 annotations');
+  assert(r.json.annotations.find((x) => x.label === '口沿宽度').distance_mm === 11,
+    '试算假设布局下 ann1 读数仍为 11 mm');
+
+  // 10) 删除标注：428 / 409 / 404 / 成功 200 且版本只 +1
+  const ann2Id = ann2Rejoined.id;
+  r = await req('DELETE', `/api/annotations/${ann2Id}`);
+  assert(r.status === 428, '删除标注缺 Base-Version => 428');
+  r = await req('DELETE', `/api/annotations/${ann2Id}`, { version: mver - 1 });
+  assert(r.status === 409, '删除标注过期版本 => 409');
+  r = await req('DELETE', '/api/annotations/999999', { version: mver });
+  assert(r.status === 404, '删除不存在的标注 => 404');
+  r = await req('DELETE', `/api/annotations/${ann2Id}`, { version: mver });
+  assert(r.status === 200 && r.json.project.version === mver + 1, '删除标注成功且版本只 +1');
+  mver = r.json.project.version;
+  assert(r.json.annotations.length === 1 && r.json.annotations[0].label === '口沿宽度', 'ann2 已删除，ann1 保留');
+
+  // 11) 删除陶片 => 涉及它的标注一并清除（ann1 涉及 M1）
+  r = await req('DELETE', `/api/sherds/${m[1]}`, { version: mver });
+  assert(r.status === 204, '删除陶片 M1');
+  r = await req('GET', `/api/projects/${mpid}`);
+  assert(r.json.annotations.length === 0, '删除陶片后涉及它的标注被清除');
+
+  // 12) 方案包：导出携带测点，导入重映射陶片身份并复算读数
+  r = await req('POST', '/api/projects', { body: { name: '测距转交', tolerance_mm: 2 } });
+  const mpid2 = r.json.project.id;
+  let m2ver = r.json.project.version;
+  const p = [];
+  for (let i = 0; i < 3; i++) {
+    const form = multipart({ label: `P${i}`, img_w: '100', img_h: '100' }, png);
+    const rr2 = await req('POST', `/api/projects/${mpid2}/sherds`, { version: m2ver, raw: form.payload, body: form });
+    m2ver = rr2.json.project.version;
+    p.push(rr2.json.sherds[rr2.json.sherds.length - 1].id);
+  }
+  for (const id of p) {
+    r = await req('PATCH', `/api/sherds/${id}/scale`, { version: m2ver, body: { scale_px: 100, scale_mm: 10 } });
+    m2ver = r.json.project.version;
+  }
+  for (const [f, t] of [[p[0], p[1]], [p[1], p[2]]]) {
+    r = await req('POST', `/api/projects/${mpid2}/seams`,
+      { version: m2ver, body: { from_id: f, to_id: t, theta_deg: 0, tx: -10, ty: 0 } });
+    m2ver = r.json.project.version;
+  }
+  // P0@(10,10)px ↔ P2@(90,90)px => 世界 (1,1) 与 (29,9) => hypot(28,8) = 29.12 mm
+  r = await req('POST', `/api/projects/${mpid2}/annotations`, {
+    version: m2ver,
+    body: { from_id: p[0], to_id: p[2], from_x: 10, from_y: 10, to_x: 90, to_y: 90, label: '跨片距' },
+  });
+  assert(r.status === 201 && r.json.annotations[0].distance_mm === 29.12, '转交源方案测距 29.12 mm');
+  m2ver = r.json.project.version;
+
+  const dlM = await reqBuf('GET', `/api/projects/${mpid2}/export`);
+  assert(dlM.status === 200, '含测距标注的方案可导出');
+  const pkgM = readManifest(dlM.buf);
+  assert(Array.isArray(pkgM.manifest.annotations) && pkgM.manifest.annotations.length === 1,
+    '导出清单携带测距标注');
+  const manAnn = pkgM.manifest.annotations[0];
+  assert(manAnn.ord === 1 && manAnn.from_ord === 1 && manAnn.to_ord === 3
+    && manAnn.from_x === 10 && manAnn.to_y === 90 && manAnn.label === '跨片距',
+    '清单测点以像素坐标保存、两端为包内陶片序号');
+
+  const impM = await importZip(dlM.buf);
+  assert(impM.status === 201, '含测距标注的方案包导入成功');
+  const impAnn = impM.json.annotations;
+  assert(impAnn.length === 1 && impAnn[0].label === '跨片距', '导入后标注保留');
+  const impIds = impM.json.sherds.map((s) => s.id);
+  assert(impIds.includes(impAnn[0].from_id) && impIds.includes(impAnn[0].to_id)
+    && !p.includes(impAnn[0].from_id) && !p.includes(impAnn[0].to_id),
+    '导入时测点两端重映射到新本地陶片 id');
+  assert(impAnn[0].computable === true && impAnn[0].distance_mm === 29.12,
+    `导入后按新方案布局复算读数为 29.12 mm（实际 ${impAnn[0].distance_mm}）`);
+
+  // 13) 既有“不含测点”的方案包（无 annotations 字段）仍可导入
+  {
+    const { files, manifest } = readManifest(dlM.buf);
+    delete manifest.annotations;
+    files.set('manifest.json', Buffer.from(JSON.stringify(manifest)));
+    const rr2 = await importZip(rebuildZip(files));
+    assert(rr2.status === 201 && Array.isArray(rr2.json.annotations) && rr2.json.annotations.length === 0,
+      '不含 annotations 字段的旧方案包仍可导入（标注为空）');
+  }
+
+  // 14) 非法测点/引用 => 整包拒绝且不留半成品
+  const projCountBeforeBadAnn = (await req('GET', '/api/projects')).json.projects.length;
+  const filesBeforeBadAnn = new Set(fs.readdirSync(process.env.UPLOAD_DIR));
+  async function expectBadAnnotation(label, mutate, reason) {
+    const { files, manifest } = readManifest(dlM.buf);
+    mutate(manifest);
+    files.set('manifest.json', Buffer.from(JSON.stringify(manifest)));
+    const rr2 = await importZip(rebuildZip(files));
+    assert(rr2.status === 400, `${label} => 400 整包拒绝（实际 ${rr2.status}）`);
+    assert(rr2.json.error && rr2.json.error.reason === reason,
+      `${label}：reason=${reason}（实际 ${rr2.json.error && rr2.json.error.reason}）`);
+  }
+  await expectBadAnnotation('测点坐标越界', (mf) => { mf.annotations[0].from_x = 9999; }, 'invalid_annotation');
+  await expectBadAnnotation('测点坐标为负', (mf) => { mf.annotations[0].to_y = -3; }, 'invalid_annotation');
+  await expectBadAnnotation('引用陶片序号越界', (mf) => { mf.annotations[0].to_ord = 99; }, 'invalid_annotation');
+  await expectBadAnnotation('两端同一片', (mf) => { mf.annotations[0].to_ord = 1; }, 'invalid_annotation');
+  await expectBadAnnotation('标注名称为空', (mf) => { mf.annotations[0].label = '  '; }, 'invalid_annotation');
+  await expectBadAnnotation('annotations 不是数组', (mf) => { mf.annotations = 'nope'; }, 'invalid_manifest');
+  await expectBadAnnotation('标注序号错乱', (mf) => { mf.annotations[0].ord = 7; }, 'invalid_manifest');
+  // 引用未标比例尺的陶片：借用前面“转交方案”的包 dl.buf（第 5 片未标比例尺）
+  {
+    const { files, manifest } = readManifest(dl.buf);
+    manifest.annotations = [{ ord: 1, from_ord: 1, to_ord: 5, from_x: 1, from_y: 1, to_x: 2, to_y: 2, label: 'x' }];
+    files.set('manifest.json', Buffer.from(JSON.stringify(manifest)));
+    const rr2 = await importZip(rebuildZip(files));
+    assert(rr2.status === 400 && rr2.json.error.reason === 'invalid_annotation',
+      '引用未标比例尺的陶片 => 400 invalid_annotation');
+  }
+  const projCountAfterBadAnn = (await req('GET', '/api/projects')).json.projects.length;
+  const filesAfterBadAnn = new Set(fs.readdirSync(process.env.UPLOAD_DIR));
+  assert(projCountAfterBadAnn === projCountBeforeBadAnn, '非法测点包未新增方案');
+  assert([...filesAfterBadAnn].filter((f) => !filesBeforeBadAnn.has(f)).length === 0,
+    '非法测点包未留下孤儿照片');
+
   console.log('\n全部冒烟检查通过 ✅');
   process.exit(0);
 }

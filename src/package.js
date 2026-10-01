@@ -4,16 +4,17 @@
 //
 // 包结构：
 //   manifest.json        方案清单（名称、毫米容差、来源版本、陶片/接缝数据、
-//                        每张照片的 sha256 摘要、闭合环校验结果与布局指纹）
+//                        跨片测距标注（像素坐标测点）、每张照片的 sha256 摘要、
+//                        闭合环校验结果与布局指纹）
 //   photos/<sha256 前16位>.<ext>   陶片照片（清单按此路径引用）
 //
-// 导出：在一次同步快照中读取方案、陶片、接缝与全部照片字节；导出期间即使
-// 方案被其他请求编辑，包内数据也必然来自同一版本（version 同时写入清单）。
+// 导出：在一次同步快照中读取方案、陶片、接缝、测距标注与全部照片字节；导出期间
+// 即使方案被其他请求编辑，包内数据也必然来自同一版本（version 同时写入清单）。
 //
-// 导入：创建**独立的新方案**，本地 id 全部重新分配并正确重关联接缝与照片。
+// 导入：创建**独立的新方案**，本地 id 全部重新分配并正确重关联接缝、测点与照片。
 // 在写库前完整校验：ZIP 结构、清单、参数、照片摘要、缺失/重复文件、越界
-// 路径、图像魔数与**全部闭合环**是否超容差；任何一项不合法即整包拒绝，
-// 由上层保证不留下方案或孤儿照片。
+// 路径、图像魔数、测点坐标/引用，以及**全部闭合环**是否超容差；任何一项不合法
+// 即整包拒绝，由上层保证不留下方案或孤儿照片。
 
 const path = require('path');
 const crypto = require('crypto');
@@ -27,7 +28,9 @@ const PHOTOS_DIR = 'photos/';
 
 const MAX_SHERDS = 100000;
 const MAX_SEAMS = 100000;
+const MAX_ANNOTATIONS = 100000;
 const MAX_NOTE_LEN = 2000;
+const MAX_ANNOTATION_LABEL_LEN = 200;
 
 class PackageError extends Error {
   constructor(message, reason = 'invalid_package', extra) {
@@ -134,9 +137,9 @@ function layoutFingerprint(comp, toleranceMm, maps) {
 // ---------- 导出：快照 → ZIP ----------
 //
 // snapshot 由上层在同步区间内准备（保证同一版本）：
-//   { project, sherds(ORDER BY id), seams(ORDER BY id), files: Map<image_file, Buffer> }
+//   { project, sherds(ORDER BY id), seams(ORDER BY id), annotations(ORDER BY id), files: Map<image_file, Buffer> }
 function buildPackageZip(snapshot) {
-  const { project, sherds, seams, files } = snapshot;
+  const { project, sherds, seams, annotations, files } = snapshot;
   const comp = layout.computeLayoutDetailed(sherds, seams, project.tolerance_mm);
   const allWithin = comp.cycleDetails.every((c) => c.within_tolerance);
 
@@ -179,6 +182,26 @@ function buildPackageZip(snapshot) {
   }));
   manifestSeams.forEach((m, i) => { m.ord = i + 1; });
 
+  // 测距标注：测点以各自照片像素坐标随包携带，两端改用包内陶片序号；
+  // 毫米读数不入包——导入端按新方案布局现算（与本地读取同一引擎）。
+  const manifestAnnotations = (annotations || []).map((an, i) => {
+    const fromOrd = sherdRowByDbId.get(an.from_id);
+    const toOrd = sherdRowByDbId.get(an.to_id);
+    if (!fromOrd || !toOrd) {
+      throw new PackageError(`测距标注 #${an.id} 引用的陶片不在本方案快照内`, 'source_annotation_invalid');
+    }
+    return {
+      ord: i + 1,
+      from_ord: fromOrd,
+      to_ord: toOrd,
+      from_x: an.from_x,
+      from_y: an.from_y,
+      to_x: an.to_x,
+      to_y: an.to_y,
+      label: an.label,
+    };
+  });
+
   // 导出指纹：把源库本地 id 统一规范化为包内 ord（陶片、接缝各自映射），
   // 这样导入端用新 id 重算后可得到完全相同的指纹。
   const exportMaps = { sherdMap: sherdRowByDbId, seamMap: seamRowByDbId };
@@ -195,6 +218,7 @@ function buildPackageZip(snapshot) {
     },
     sherds: manifestSherds,
     seams: manifestSeams,
+    annotations: manifestAnnotations,
     checks: {
       all_cycles_within_tolerance: allWithin,
       cycle_residuals: comp.residuals.map((r) => ({
@@ -423,6 +447,72 @@ function readAndValidatePackage(zipBuffer, { maxPhotoBytes } = {}) {
     return { ord, from_ord: fromOrd, to_ord: toOrd, theta_deg: theta, tx, ty, join_note: note };
   });
 
+  // 6.5) 测距标注（可选段）：既有不含测点的方案包（无 annotations 字段）仍可导入。
+  //      若给出则逐条校验：序号连续、引用陶片序号合法且不同、两端已标比例尺、
+  //      像素坐标落在各自照片内、标注名称非空；任一不合法即整包拒绝（不写库）。
+  //      注意：不要求两端当前连通——断开时标注合法存在（读数标为不可计算）。
+  let planAnnotations = [];
+  if (manifest.annotations !== undefined && manifest.annotations !== null) {
+    if (!Array.isArray(manifest.annotations)) {
+      throw new PackageError('清单 annotations 必须是数组', 'invalid_manifest');
+    }
+    if (manifest.annotations.length > MAX_ANNOTATIONS) {
+      throw new PackageError(`测距标注数量超过上限 ${MAX_ANNOTATIONS}`, 'invalid_manifest');
+    }
+    planAnnotations = manifest.annotations.map((an, i) => {
+      const ord = i + 1;
+      const where = `测距标注 #${ord}`;
+      if (!an || typeof an !== 'object' || Array.isArray(an)) {
+        throw new PackageError(`${where} 不是对象`, 'invalid_manifest');
+      }
+      if (an.ord !== undefined && an.ord !== ord) {
+        throw new PackageError(`${where} 的序号 ord 与其排列位置不一致`, 'invalid_manifest');
+      }
+      const fromOrd = Number(an.from_ord);
+      const toOrd = Number(an.to_ord);
+      if (!Number.isInteger(fromOrd) || !Number.isInteger(toOrd) ||
+          fromOrd < 1 || fromOrd > planSherds.length || toOrd < 1 || toOrd > planSherds.length) {
+        throw new PackageError(`${where} 引用的陶片序号越界`, 'invalid_annotation');
+      }
+      if (fromOrd === toOrd) {
+        throw new PackageError(`${where} 两个测点在同一片陶片上`, 'invalid_annotation');
+      }
+      const fromSh = planSherds[fromOrd - 1];
+      const toSh = planSherds[toOrd - 1];
+      if (!fromSh.scale_px || !toSh.scale_px) {
+        throw new PackageError(`${where} 引用的陶片未标记毫米比例尺`, 'invalid_annotation');
+      }
+      const pts = [
+        ['from_x', an.from_x, fromSh.img_w], ['from_y', an.from_y, fromSh.img_h],
+        ['to_x', an.to_x, toSh.img_w], ['to_y', an.to_y, toSh.img_h],
+      ];
+      const coord = { from_x: null, from_y: null, to_x: null, to_y: null };
+      for (const [field, raw, hi] of pts) {
+        const v = Number(raw);
+        if (!Number.isFinite(v) || v < 0 || v > hi) {
+          throw new PackageError(
+            `${where} 的 ${field} 超出照片像素范围（0 ~ ${hi}）`, 'invalid_annotation');
+        }
+        coord[field] = v;
+      }
+      const label = typeof an.label === 'string' ? an.label.trim() : '';
+      if (!label) throw new PackageError(`${where} 缺少标注名称`, 'invalid_annotation');
+      if (label.length > MAX_ANNOTATION_LABEL_LEN) {
+        throw new PackageError(`${where} 标注名称过长（最多 ${MAX_ANNOTATION_LABEL_LEN} 字符）`, 'invalid_annotation');
+      }
+      return {
+        ord,
+        from_ord: fromOrd,
+        to_ord: toOrd,
+        from_x: coord.from_x,
+        from_y: coord.from_y,
+        to_x: coord.to_x,
+        to_y: coord.to_y,
+        label,
+      };
+    });
+  }
+
   // 7) 以临时本地 id（= ord）重算布局：闭合环全部必须在容差内
   const tempSherds = planSherds.map((sh) => ({
     id: sh.ord,
@@ -443,7 +533,7 @@ function readAndValidatePackage(zipBuffer, { maxPhotoBytes } = {}) {
   const comp = layout.computeLayoutDetailed(tempSherds, tempSeams, tolerance);
   const violations = comp.cycleDetails.filter((c) => !c.within_tolerance);
 
-  return { manifest, planSherds, planSeams, comp, tolerance, violations, tempSherds, tempSeams };
+  return { manifest, planSherds, planSeams, planAnnotations, comp, tolerance, violations, tempSherds, tempSeams };
 }
 
 // 几何校验（闭合环）单独成步：上层可先解析再据此返回 422。

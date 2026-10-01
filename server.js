@@ -8,6 +8,7 @@ const multer = require('multer');
 const crypto = require('crypto');
 const { openDb } = require('./src/db');
 const layout = require('./src/layout');
+const measure = require('./src/measure');
 const pkg = require('./src/package');
 
 const PORT = parseInt(process.env.PORT || '8080', 10);
@@ -235,9 +236,10 @@ function buildBatchViolations(result, sherds, toleranceMm) {
 }
 
 // 试算返回体：与 GET /api/projects/:id 同构，但 seams 为“既有接缝 + 候选虚拟接缝”
-// （候选 id 为负、带 candidate_index），layout 为整批加入后的现算结果。
-function batchPayload(project, sherds, result, toleranceMm, { previewOnly }) {
-  const fakeState = { project, sherds, seams: result.all_seams, computed: result.layout };
+// （候选 id 为负、带 candidate_index），layout 为整批加入后的现算结果；
+// annotations 为既有测距标注在“整批加入后的假设布局”下现算的读数。
+function batchPayload(project, sherds, result, toleranceMm, { previewOnly, annotations }) {
+  const fakeState = { project, sherds, seams: result.all_seams, annotations, computed: result.layout };
   const payload = statePayload(fakeState);
   payload.seams = result.all_seams.map((s) => ({
     id: s.id < 0 ? null : s.id,
@@ -293,8 +295,11 @@ function loadState(projectId) {
   const seams = db
     .prepare('SELECT * FROM seams WHERE project_id = ? ORDER BY id')
     .all(projectId);
+  const annotations = db
+    .prepare('SELECT * FROM annotations WHERE project_id = ? ORDER BY id')
+    .all(projectId);
   const computed = layout.computeLayout(sherds, seams, project.tolerance_mm);
-  return { project, sherds, seams, computed };
+  return { project, sherds, seams, annotations, computed };
 }
 
 function statePayload(state) {
@@ -326,6 +331,8 @@ function statePayload(state) {
       join_note: s.join_note,
       created_at: s.created_at,
     })),
+    // 测距标注读数随本次布局现算（预览场景下即“假设布局”的读数）。
+    annotations: measure.computeAnnotations(state.annotations || [], state.sherds, state.computed),
     layout: state.computed,
   };
 }
@@ -333,8 +340,9 @@ function statePayload(state) {
 // 接缝修订（预览/确认共用）的返回体：保持与 statePayload 相同的接缝读取契约，
 // 但接缝列表为“按原 id 与排序替换参数后”的假设集合，layout 为相应重算结果。
 // 预览时该结果不入库；确认成功后 GET /api/projects/:id 与之一致。
-function revisionPayload(project, sherds, result, seamId) {
-  const fakeState = { project, sherds, seams: result.revised_seams, computed: result.layout };
+// annotations 为既有测距标注在“假设布局”下现算的读数（预览同样只读）。
+function revisionPayload(project, sherds, result, seamId, annotations) {
+  const fakeState = { project, sherds, seams: result.revised_seams, annotations, computed: result.layout };
   const payload = statePayload(fakeState);
   payload.base_version = project.version;
   payload.revised_seam_id = seamId;
@@ -444,11 +452,12 @@ const packageUpload = multer({
 
 app.get('/api/projects/:id/export', wrap((req, res) => {
   const pid = num(req.params.id, 'id');
-  // 同步快照：project / sherds / seams / 照片字节在同一同步区间读取。
+  // 同步快照：project / sherds / seams / annotations / 照片字节在同一同步区间读取。
   const project = db.prepare('SELECT * FROM projects WHERE id = ?').get(pid);
   if (!project) throw new HttpError(404, '方案不存在');
   const sherds = db.prepare('SELECT * FROM sherds WHERE project_id = ? ORDER BY id').all(pid);
   const seams = db.prepare('SELECT * FROM seams WHERE project_id = ? ORDER BY id').all(pid);
+  const annotations = db.prepare('SELECT * FROM annotations WHERE project_id = ? ORDER BY id').all(pid);
   if (sherds.length === 0) {
     throw new HttpError(400, '空方案（没有陶片照片）不能导出方案包，请先上传陶片', { reason: 'export_empty_project' });
   }
@@ -465,7 +474,7 @@ app.get('/api/projects/:id/export', wrap((req, res) => {
 
   let zip;
   try {
-    zip = pkg.buildPackageZip({ project, sherds, seams, files });
+    zip = pkg.buildPackageZip({ project, sherds, seams, annotations, files });
   } catch (e) {
     if (e instanceof pkg.PackageError) throw new HttpError(500, `导出失败：${e.message}`);
     throw e;
@@ -551,6 +560,20 @@ const handlePackageImport = wrap(async (req, res) => {
           sm.theta_deg, sm.tx, sm.ty, sm.join_note
         );
         seamIdMap.set(sm.ord, sr.lastInsertRowid);
+      }
+
+      // 测距标注：两端陶片序号重映射为新本地 id 后按包内顺序插入；
+      // 毫米读数不入库，导入后的读取响应会按新方案布局现算。
+      const insertAnnotation = db.prepare(
+        'INSERT INTO annotations(project_id, from_id, to_id, from_x, from_y, to_x, to_y, label) VALUES (?,?,?,?,?,?,?,?)'
+      );
+      for (const an of plan.planAnnotations) {
+        insertAnnotation.run(
+          pid,
+          sherdIdMap.get(an.from_ord),
+          sherdIdMap.get(an.to_ord),
+          an.from_x, an.from_y, an.to_x, an.to_y, an.label
+        );
       }
       return pid;
     });
@@ -793,9 +816,10 @@ app.post('/api/seams/:id/revision-preview', wrap((req, res) => {
 
   const sherds = db.prepare('SELECT * FROM sherds WHERE project_id = ?').all(seam.project_id);
   const seams = db.prepare('SELECT * FROM seams WHERE project_id = ? ORDER BY id').all(seam.project_id);
+  const annotations = db.prepare('SELECT * FROM annotations WHERE project_id = ? ORDER BY id').all(seam.project_id);
   const result = layout.evaluateSeamRevision(sherds, seams, seamId, revised, project.tolerance_mm);
   // 接缝存在时 evaluateSeamRevision 必返回非 null。
-  const payload = revisionPayload(project, sherds, result, seamId);
+  const payload = revisionPayload(project, sherds, result, seamId, annotations);
   payload.preview_only = true;
   payload.violations = buildRevisionViolations(result, sherds, project.tolerance_mm);
   res.json(payload);
@@ -859,8 +883,9 @@ app.post('/api/projects/:id/seams/batch-preview', wrap((req, res) => {
   const project = getProjectOr404(pid);
   const { candidates, sherds } = parseBatchCandidates(req.body || {}, pid);
   const seams = db.prepare('SELECT * FROM seams WHERE project_id = ? ORDER BY id').all(pid);
+  const annotations = db.prepare('SELECT * FROM annotations WHERE project_id = ? ORDER BY id').all(pid);
   const result = layout.evaluateSeamBatch(sherds, seams, candidates, project.tolerance_mm);
-  const payload = batchPayload(project, sherds, result, project.tolerance_mm, { previewOnly: true });
+  const payload = batchPayload(project, sherds, result, project.tolerance_mm, { previewOnly: true, annotations });
   payload.batch_fingerprint = batchFingerprint(candidates);
   res.json(payload);
 }));
@@ -942,6 +967,89 @@ app.post('/api/projects/:id/seams/batch-commit', wrap((req, res) => {
   txn();
 
   res.json(statePayload(loadState(pid)));
+}));
+
+// ---------- API: 跨片测距标注 ----------
+//
+// 测点以各自照片的像素坐标保存；毫米读数不入库，读取时按当前比例尺与
+// 已采纳接缝推导的位姿现算（见 src/measure.js）。
+// 创建校验（任一不满足即 400 指出原因且不写入）：
+//   两片均属本方案、均已标比例尺、当前处于同一连通组、坐标落在各自照片内。
+// 写入遵循 Base-Version 乐观锁：缺头 428、过期 409，成功只推进一次方案版本。
+
+const ANNOTATION_LABEL_MAX = 200;
+
+// 解析并校验测距标注入参；返回可入库的字段。任何不合法都抛 400 且不写库。
+function parseAnnotationBody(body, pid) {
+  const fromId = num(body.from_id, 'from_id', { min: 1 });
+  const toId = num(body.to_id, 'to_id', { min: 1 });
+  if (fromId === toId) {
+    throw new HttpError(400, '两个测点必须分别落在两片不同的陶片上', { reason: 'annotation_same_sherd' });
+  }
+  const label = str(body.label, 'label', { max: ANNOTATION_LABEL_MAX }).trim();
+  if (!label) throw new HttpError(400, '请填写标注名称 label', { reason: 'annotation_label_missing' });
+  const fromX = num(body.from_x, 'from_x');
+  const fromY = num(body.from_y, 'from_y');
+  const toX = num(body.to_x, 'to_x');
+  const toY = num(body.to_y, 'to_y');
+
+  const from = db.prepare('SELECT * FROM sherds WHERE id = ? AND project_id = ?').get(fromId, pid);
+  const to = db.prepare('SELECT * FROM sherds WHERE id = ? AND project_id = ?').get(toId, pid);
+  if (!from || !to) {
+    throw new HttpError(400, '测点两端的陶片不属于该方案或不存在', { reason: 'annotation_sherd_mismatch' });
+  }
+  if (!from.scale_px || !from.scale_mm || !to.scale_px || !to.scale_mm) {
+    throw new HttpError(400, '两片陶片都必须先标记毫米比例尺，才能记录跨片测距', { reason: 'annotation_scale_missing' });
+  }
+  // 坐标须落在各自照片像素范围内。
+  const outOfBounds =
+    fromX < 0 || fromX > from.img_w || fromY < 0 || fromY > from.img_h ||
+    toX < 0 || toX > to.img_w || toY < 0 || toY > to.img_h;
+  if (outOfBounds) {
+    throw new HttpError(400,
+      `测点坐标须落在照片像素范围内（#${fromId}：0~${from.img_w} × 0~${from.img_h}；#${toId}：0~${to.img_w} × 0~${to.img_h}）`,
+      { reason: 'annotation_point_out_of_bounds' });
+  }
+  return { fromId, toId, fromX, fromY, toX, toY, label };
+}
+
+app.post('/api/projects/:id/annotations', wrap((req, res) => {
+  const pid = num(req.params.id, 'id');
+  const project = getProjectOr404(pid);
+  checkVersion(req, project);
+  const parsed = parseAnnotationBody(req.body || {}, pid);
+
+  // 两片当前须处于同一连通组（布局现算，与读取口径一致）。
+  const sherds = db.prepare('SELECT * FROM sherds WHERE project_id = ?').all(pid);
+  const seams = db.prepare('SELECT * FROM seams WHERE project_id = ? ORDER BY id').all(pid);
+  const computed = layout.computeLayout(sherds, seams, project.tolerance_mm);
+  const groupOf = new Map();
+  for (const g of computed.groups) for (const id of g.member_ids) groupOf.set(id, g.root_sherd_id);
+  if (groupOf.get(parsed.fromId) === undefined || groupOf.get(parsed.fromId) !== groupOf.get(parsed.toId)) {
+    throw new HttpError(400, '两片陶片当前不在同一连通组，无法记录跨片测距', { reason: 'annotation_not_connected' });
+  }
+
+  const txn = db.transaction(() => {
+    db.prepare(
+      'INSERT INTO annotations(project_id, from_id, to_id, from_x, from_y, to_x, to_y, label) VALUES (?,?,?,?,?,?,?,?)'
+    ).run(pid, parsed.fromId, parsed.toId, parsed.fromX, parsed.fromY, parsed.toX, parsed.toY, parsed.label);
+    bump(pid);
+  });
+  txn();
+  res.status(201).json(statePayload(loadState(pid)));
+}));
+
+app.delete('/api/annotations/:id', wrap((req, res) => {
+  const ann = db.prepare('SELECT * FROM annotations WHERE id = ?').get(num(req.params.id, 'id'));
+  if (!ann) throw new HttpError(404, '测距标注不存在');
+  const project = getProjectOr404(ann.project_id);
+  checkVersion(req, project);
+  const txn = db.transaction(() => {
+    db.prepare('DELETE FROM annotations WHERE id = ?').run(ann.id);
+    bump(ann.project_id);
+  });
+  txn();
+  res.json(statePayload(loadState(ann.project_id)));
 }));
 
 // ---------- 错误处理 ----------
